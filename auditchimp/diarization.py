@@ -17,8 +17,6 @@ class DiarizationEngine:
     def __init__(self, config):
         self.config = config
         self.msdd_model = None
-        self.vad_model = None
-        self.speaker_model = None
         self.device = "cuda" if torch.cuda.is_available() and config.DIARIZATION_USE_GPU else "cpu"
 
     async def initialize(self):
@@ -46,51 +44,67 @@ class DiarizationEngine:
             raise
 
     def _get_diarizer_config(self):
-        """Get NeMo diarizer configuration."""
+        """Get complete NeMo diarizer configuration with all required parameters."""
         from omegaconf import OmegaConf
 
-        # NeMo diarizer configuration
+        # Complete NeMo diarizer configuration following official structure
         config = {
             'device': self.device,
             'num_workers': 0 if self.device == 'cpu' else 2,
             'sample_rate': 16000,
-            'batch_size': 1,  # Use 1 for Mac CPU
-            'verbose': False,  # Reduce log noise
+            'batch_size': 1,
+            'verbose': True,  # Enable verbose logging to debug
             'diarizer': {
-                'manifest_filepath': None,  # Will be set per audio file
+                # Core diarizer settings
+                'manifest_filepath': None,  # Set per audio file
                 'out_dir': str(self.config.TEMP_DIR),
                 'oracle_vad': False,
-                'num_workers': 0 if self.device == 'cpu' else 2,  # CPU-safe workers
-                'sample_rate': 16000,  # Audio sample rate
-                'clustering': {
-                    'parameters': {
-                        'oracle_num_speakers': False,
-                        'max_num_speakers': 8,
-                        'enhanced_count_thres': 80,
-                        'max_rp_threshold': 0.25,
-                        'sparse_search_volume': 30,
-                    }
-                },
+                'collar': 0.25,  # Collar value for scoring tolerance
+                'ignore_overlap': True,  # Ignore overlap segments in scoring
+
+                # Worker settings
+                'num_workers': 0 if self.device == 'cpu' else 2,
+                'sample_rate': 16000,
+
+                # VAD Configuration
                 'vad': {
                     'model_path': 'vad_multilingual_marblenet',
+                    'external_vad_manifest': None,
                     'parameters': {
                         'window_length_in_sec': 0.15,
                         'shift_length_in_sec': 0.01,
-                        'onset': 0.8,
-                        'offset': 0.6,
+                        'smoothing': 'median',
+                        'overlap': 0.875,
+                        'onset': 0.4,  # Standard threshold for multi-speaker
+                        'offset': 0.7,
                         'pad_onset': 0.05,
                         'pad_offset': -0.1,
                         'min_duration_on': 0.2,
                         'min_duration_off': 0.2,
+                        'filter_speech_first': True,
                     }
                 },
+
+                # Speaker Embeddings Configuration - Optimized for quick speaker turns
                 'speaker_embeddings': {
                     'model_path': 'titanet_large',
                     'parameters': {
-                        'window_length_in_sec': 1.5,
-                        'shift_length_in_sec': 0.75,
-                        'multiscale_weights': [1, 2, 3, 4, 5, 6],
+                        'window_length_in_sec': 1.0,  # REDUCED: Shorter window for quick speaker turns
+                        'shift_length_in_sec': 0.5,   # REDUCED: More frequent sampling
+                        'multiscale_weights': None,
                         'save_embeddings': False,
+                    }
+                },
+
+                # Clustering Configuration - Optimized for multi-speaker detection
+                'clustering': {
+                    'parameters': {
+                        'oracle_num_speakers': False,
+                        'max_num_speakers': 4,  # Limit to 4 speakers for better accuracy
+                        'enhanced_count_thres': 40,  # LOWERED: Trigger enhanced counting earlier
+                        'max_rp_threshold': 0.15,  # LOWERED: Be more conservative about merging speakers
+                        'sparse_search_volume': 30,
+                        'maj_vote_spk_count': True,  # ENABLED: Use majority voting for robust speaker counting
                     }
                 },
             }
@@ -98,67 +112,61 @@ class DiarizationEngine:
 
         return OmegaConf.create(config)
 
-    def _extract_vad_segments(self, audio_path: str) -> List[Dict]:
+    def _extract_vad_segments_from_diarization(self, diarization_segments: List[Dict]) -> List[Dict]:
         """
-        Extract VAD (Voice Activity Detection) segments separately for finer control.
+        Extract VAD segments from diarization results.
+
+        Since ClusteringDiarizer already performs VAD internally,
+        we use the diarization segments as VAD segments for simplicity.
 
         Args:
-            audio_path: Path to audio file
+            diarization_segments: Speaker segments from diarization
 
         Returns:
             List of VAD segments with start/end timestamps
         """
         try:
-            from nemo.collections.asr.models import EncDecClassificationModel
-            import librosa
+            # Convert diarization segments to VAD format (speech regions)
+            vad_segments = []
 
-            logger.info("Extracting VAD segments with NeMo MarbleNet...")
+            # Sort segments by start time
+            sorted_segments = sorted(diarization_segments, key=lambda x: x["start"])
 
-            # Load VAD model (MarbleNet)
-            if not hasattr(self, 'vad_model') or self.vad_model is None:
-                self.vad_model = EncDecClassificationModel.from_pretrained(
-                    model_name="vad_multilingual_marblenet"
-                )
-                if self.device == "cuda":
-                    self.vad_model = self.vad_model.to(self.device)
+            # Merge overlapping or adjacent segments to create continuous speech regions
+            if not sorted_segments:
+                return []
 
-            # Get audio duration
-            duration = librosa.get_duration(filename=audio_path)
+            current_segment = {
+                "start": sorted_segments[0]["start"],
+                "end": sorted_segments[0]["end"],
+                "type": "speech"
+            }
 
-            # VAD inference with fine-grained parameters
-            vad_segments = self.vad_model(
-                audio_file=audio_path,
-                window_length_in_sec=0.15,  # Fine-grained 150ms windows
-                shift_length_in_sec=0.01,   # 10ms shifts for precision
-                onset=0.8,                  # High threshold for speech start
-                offset=0.6,                 # Lower threshold for speech end
-                pad_onset=0.05,             # Small padding at start
-                pad_offset=0.0,             # No padding at end
-                min_duration_on=0.2,        # Minimum speech duration 200ms
-                min_duration_off=0.2,       # Minimum silence duration 200ms
-            )
+            for seg in sorted_segments[1:]:
+                # If segments overlap or are very close (within 0.1s), merge them
+                if seg["start"] <= current_segment["end"] + 0.1:
+                    current_segment["end"] = max(current_segment["end"], seg["end"])
+                else:
+                    # Save current segment and start new one
+                    vad_segments.append(current_segment)
+                    current_segment = {
+                        "start": seg["start"],
+                        "end": seg["end"],
+                        "type": "speech"
+                    }
 
-            # Convert to segment format
-            segments = []
-            for seg in vad_segments:
-                segments.append({
-                    "start": float(seg[0]),
-                    "end": float(seg[1]),
-                    "type": "speech"
-                })
+            # Don't forget the last segment
+            vad_segments.append(current_segment)
 
-            logger.info(f"VAD extraction completed: {len(segments)} speech segments from {duration:.2f}s audio")
+            logger.info(f"Extracted {len(vad_segments)} VAD segments from {len(diarization_segments)} diarization segments")
 
-            return segments
+            return vad_segments
 
         except Exception as e:
             logger.error(f"VAD extraction failed: {e}")
-            logger.warning("Falling back to full audio duration")
-
-            # Fallback: return full audio as single segment
-            import librosa
-            duration = librosa.get_duration(filename=audio_path)
-            return [{"start": 0.0, "end": duration, "type": "speech"}]
+            # Return diarization segments as-is if extraction fails
+            return [{"start": s["start"], "end": s["end"], "type": "speech"}
+                    for s in diarization_segments]
 
     def _detect_overlapping_speech(
         self,
@@ -201,37 +209,6 @@ class DiarizationEngine:
         logger.info(f"Detected {len(overlaps)} overlapping speech regions")
         return overlaps
 
-    import torchaudio
-    import torch
-    from pathlib import Path
-    def _ensure_mono_audio(self, audio_path: str) -> str:
-        """
-        Ensure audio is mono (NeMo requires mono input). If stereo, convert to mono.
-        Returns path to the (possibly converted) audio file.
-        """
-        try:
-            waveform, sample_rate = torchaudio.load(audio_path)
-
-            # Ensure waveform is 2D [channels, time]
-            if waveform.ndim == 1:
-                waveform = waveform.unsqueeze(0)
-
-            # Convert stereo → mono by averaging channels
-            if waveform.shape[0] > 1:
-                logger.info(f"Converting stereo ({waveform.shape[0]}ch) to mono...")
-                waveform = waveform.mean(dim=0, keepdim=True)
-
-            # Normalize to prevent clipping
-            waveform = waveform / waveform.abs().max()
-
-            mono_path = Path(self.config.TEMP_DIR) / f"{Path(audio_path).stem}_mono.wav"
-            torchaudio.save(str(mono_path), waveform, sample_rate)
-            return str(mono_path)
-
-        except Exception as e:
-            logger.warning(f"Failed to ensure mono audio: {e}. Using original file.")
-            return audio_path
-    
     def _diarize_nemo_sync(self, audio_path: str) -> Dict:
         """
         Diarize using NeMo ClusteringDiarizer (synchronous version for thread pool).
@@ -245,49 +222,110 @@ class DiarizationEngine:
         try:
             logger.info("Starting NeMo diarization...")
 
-            # Convert to mono if stereo (NeMo requires mono audio)
-            import torchaudio
-            mono_audio_path = self._ensure_mono_audio(audio_path)
+            # Convert to mono 16kHz if needed (NeMo requires mono audio at 16kHz)
+            import librosa
+            import soundfile as sf
+            import shutil
+            import uuid
+
+            # Load audio and convert to mono 16kHz
+            logger.info(f"Loading audio file: {audio_path}")
+            audio, sr = librosa.load(audio_path, sr=16000, mono=True)
+
+            # Create unique output directory for this diarization run to avoid conflicts
+            unique_id = str(uuid.uuid4())[:8]
+            output_dir = Path(self.config.TEMP_DIR) / f"diarization_{unique_id}"
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save as temporary mono file
+            mono_audio_path = output_dir / f"{Path(audio_path).stem}_mono.wav"
+            sf.write(mono_audio_path, audio, 16000)
+            logger.info(f"Converted to mono 16kHz: {mono_audio_path}")
+
+            # Get audio duration
+            duration = librosa.get_duration(y=audio, sr=16000)
+            logger.info(f"Audio duration: {duration:.2f}s")
+
+            # Clean up NeMo output directories if they exist (prevents "File exists" errors)
+            nemo_dirs = ['speaker_outputs', 'pred_rttms']
+            for dir_name in nemo_dirs:
+                dir_path = output_dir / dir_name
+                if dir_path.exists():
+                    shutil.rmtree(dir_path)
 
             # Create temporary manifest file
-            manifest_path = Path(self.config.TEMP_DIR) / f"{Path(mono_audio_path).stem}_manifest.json"
+            manifest_path = output_dir / f"{Path(audio_path).stem}_manifest.json"
 
-            # Create manifest entry
+            # Create manifest entry with mono audio path
+            # IMPORTANT: NeMo expects specific format
             manifest_data = {
                 "audio_filepath": str(mono_audio_path),
                 "offset": 0,
                 "duration": None,
                 "label": "infer",
                 "text": "-",
-                "num_speakers": None,
+                "num_speakers": None,  # Let NeMo detect automatically
                 "rttm_filepath": None,
                 "uem_filepath": None
             }
 
-            # Write manifest
+            # Write manifest (one JSON object per line)
             with open(manifest_path, 'w') as f:
                 json.dump(manifest_data, f)
                 f.write('\n')
 
-            # Update config with manifest path
+            logger.info(f"Created manifest file: {manifest_path}")
+            logger.info(f"Manifest content: {manifest_data}")
+
+            # Verify audio file exists
+            if not mono_audio_path.exists():
+                raise FileNotFoundError(f"Mono audio file not found: {mono_audio_path}")
+            logger.info(f"Mono audio file exists: {mono_audio_path} ({mono_audio_path.stat().st_size} bytes)")
+
+            # Update config with manifest path and unique output directory
             self.msdd_model._cfg.diarizer.manifest_filepath = str(manifest_path)
-            self.msdd_model._cfg.diarizer.out_dir = str(self.config.TEMP_DIR)
+            self.msdd_model._cfg.diarizer.out_dir = str(output_dir)
+
+            logger.info(f"Updated diarizer config:")
+            logger.info(f"  - manifest_filepath: {self.msdd_model._cfg.diarizer.manifest_filepath}")
+            logger.info(f"  - out_dir: {self.msdd_model._cfg.diarizer.out_dir}")
+            logger.info(f"  - oracle_vad: {self.msdd_model._cfg.diarizer.oracle_vad}")
+            logger.info(f"  - clustering params: {self.msdd_model._cfg.diarizer.clustering.parameters}")
 
             # Run diarization
+            logger.info("Running NeMo diarization...")
             self.msdd_model.diarize()
+            logger.info("Diarization completed, reading results...")
 
-            # Read RTTM output
-            rttm_path = Path(self.config.TEMP_DIR) / f"{Path(audio_path).stem}.rttm"
+            # NeMo saves RTTM output to pred_rttms subdirectory
+            # The filename uses the base name from the audio file in the manifest
+            pred_rttms_dir = output_dir / "pred_rttms"
+            rttm_filename = f"{Path(audio_path).stem}_mono.rttm"
+            rttm_path = pred_rttms_dir / rttm_filename
+
+            logger.info(f"Looking for RTTM file at: {rttm_path}")
+            logger.info(f"pred_rttms directory exists: {pred_rttms_dir.exists()}")
+            if pred_rttms_dir.exists():
+                logger.info(f"Contents of pred_rttms: {list(pred_rttms_dir.iterdir())}")
 
             segments = []
+            unique_speakers = set()
             if rttm_path.exists():
+                logger.info(f"Reading RTTM file: {rttm_path}")
                 with open(rttm_path, 'r') as f:
-                    for line in f:
+                    rttm_content = f.read()
+                    logger.info(f"RTTM content:\n{rttm_content}")
+
+                    # Parse RTTM lines
+                    for line in rttm_content.strip().split('\n'):
+                        if not line.strip():
+                            continue
                         parts = line.strip().split()
                         if len(parts) >= 8:
                             start = float(parts[3])
                             duration = float(parts[4])
                             speaker = parts[7]
+                            unique_speakers.add(speaker)
 
                             segments.append({
                                 "start": start,
@@ -295,37 +333,49 @@ class DiarizationEngine:
                                 "speaker": speaker
                             })
 
-                # Clean up temp files
-                rttm_path.unlink(missing_ok=True)
+                logger.info(f"Detected {len(unique_speakers)} unique speakers: {unique_speakers}")
+            else:
+                logger.error(f"RTTM file not found at: {rttm_path}")
+                logger.error(f"Output directory contents: {list(output_dir.iterdir()) if output_dir.exists() else 'directory does not exist'}")
 
-            manifest_path.unlink(missing_ok=True)
+            # Clean up entire output directory with all temp files
+            try:
+                shutil.rmtree(output_dir)
+                logger.debug(f"Cleaned up temporary directory: {output_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temp directory {output_dir}: {e}")
 
             if not segments:
                 logger.warning("No speakers detected, creating single speaker segment")
                 # Fallback: create a single speaker for entire audio
-                segments = [{"start": 0.0, "end": 10.0, "speaker": "SPEAKER_00"}]
+                segments = [{"start": 0.0, "end": duration, "speaker": "SPEAKER_00"}]
 
-            # Extract VAD segments separately for finer control
-            logger.info("Extracting VAD segments for precise speech boundaries...")
-            vad_segments = self._extract_vad_segments(audio_path)
+            # Extract VAD segments from diarization results
+            logger.info("Extracting VAD segments from diarization results...")
+            vad_segments = self._extract_vad_segments_from_diarization(segments)
 
             # Detect overlapping speech
             logger.info("Detecting overlapping speech regions...")
             overlaps = self._detect_overlapping_speech(segments)
 
-            logger.info(f"NeMo diarization completed: {len(segments)} segments, {len(set(s['speaker'] for s in segments))} speakers")
+            num_speakers = len(set(s['speaker'] for s in segments))
+            logger.info(f"NeMo diarization completed: {len(segments)} segments, {num_speakers} speakers")
+            logger.info(f"Speakers found: {set(s['speaker'] for s in segments)}")
             logger.info(f"VAD extracted: {len(vad_segments)} speech segments")
             logger.info(f"Overlaps detected: {len(overlaps)} regions")
 
-            return {
+            result = {
                 "segments": segments,
-                "vad_segments": vad_segments,  # NEW: Separate VAD for chunking
-                "overlaps": overlaps,          # NEW: Overlapping speech regions
+                "vad_segments": vad_segments,  # Separate VAD for chunking
+                "overlaps": overlaps,          # Overlapping speech regions
                 "method": "nemo",
                 "device": self.device,
-                "num_speakers": len(set(s['speaker'] for s in segments)),
+                "num_speakers": num_speakers,
                 "vad_enabled": True
             }
+
+            logger.info(f"Returning diarization result with {num_speakers} speakers")
+            return result
 
         except Exception as e:
             logger.error(f"NeMo diarization failed: {e}")
