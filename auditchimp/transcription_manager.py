@@ -132,10 +132,12 @@ class TranscriptionEngineManager:
         source_language: str = "auto",
         target_language: str = "auto",
         accurate_mode: bool = False,
-        diarization_segments: Optional[List[Dict]] = None
+        diarization_segments: Optional[List[Dict]] = None,
+        vad_segments: Optional[List[Dict]] = None,
+        overlaps: Optional[List[Dict]] = None
     ) -> Dict:
         """
-        Transcribe audio using the appropriate engine.
+        Transcribe audio using the appropriate engine with VAD-based chunking.
 
         Routes to IndicConformer for Indian language transcription,
         Whisper for translation or unsupported languages.
@@ -146,6 +148,8 @@ class TranscriptionEngineManager:
             target_language: Target language code or "auto"
             accurate_mode: Whether to use accurate mode (Whisper only)
             diarization_segments: Optional speaker diarization segments
+            vad_segments: Optional VAD segments for precise chunking
+            overlaps: Optional overlapping speech regions
 
         Returns:
             Dictionary containing transcription results and metadata
@@ -169,13 +173,26 @@ class TranscriptionEngineManager:
                 # Lazy load if not preloaded
                 await self._load_indic()
 
-                result = await self.indic_engine.transcribe_with_chunking(
-                    audio_path=audio_path,
-                    language=source_lang,
-                    chunk_duration=self.config.INDIC_CHUNK_DURATION,
-                    overlap=self.config.INDIC_CHUNK_OVERLAP,
-                    diarization_segments=diarization_segments
-                )
+                # Use VAD-based chunking if VAD segments are available
+                if vad_segments:
+                    logger.info(f"Using VAD-based chunking with {len(vad_segments)} speech segments")
+                    result = await self.indic_engine.transcribe_with_vad_chunking(
+                        audio_path=audio_path,
+                        language=source_lang,
+                        vad_segments=vad_segments,
+                        diarization_segments=diarization_segments,
+                        overlaps=overlaps
+                    )
+                else:
+                    # Fallback to time-based chunking
+                    logger.info("Using time-based chunking (no VAD segments provided)")
+                    result = await self.indic_engine.transcribe_with_chunking(
+                        audio_path=audio_path,
+                        language=source_lang,
+                        chunk_duration=self.config.INDIC_CHUNK_DURATION,
+                        overlap=self.config.INDIC_CHUNK_OVERLAP,
+                        diarization_segments=diarization_segments
+                    )
 
                 # Add engine metadata
                 result["engine"] = "indic-conformer"

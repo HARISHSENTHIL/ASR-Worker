@@ -92,6 +92,109 @@ class DiarizationEngine:
 
         return OmegaConf.create(config)
 
+    def _extract_vad_segments(self, audio_path: str) -> List[Dict]:
+        """
+        Extract VAD (Voice Activity Detection) segments separately for finer control.
+
+        Args:
+            audio_path: Path to audio file
+
+        Returns:
+            List of VAD segments with start/end timestamps
+        """
+        try:
+            from nemo.collections.asr.models import EncDecClassificationModel
+            import librosa
+
+            logger.info("Extracting VAD segments with NeMo MarbleNet...")
+
+            # Load VAD model (MarbleNet)
+            if not hasattr(self, 'vad_model') or self.vad_model is None:
+                self.vad_model = EncDecClassificationModel.from_pretrained(
+                    model_name="vad_multilingual_marblenet"
+                )
+                if self.device == "cuda":
+                    self.vad_model = self.vad_model.to(self.device)
+
+            # Get audio duration
+            duration = librosa.get_duration(filename=audio_path)
+
+            # VAD inference with fine-grained parameters
+            vad_segments = self.vad_model(
+                audio_file=audio_path,
+                window_length_in_sec=0.15,  # Fine-grained 150ms windows
+                shift_length_in_sec=0.01,   # 10ms shifts for precision
+                onset=0.8,                  # High threshold for speech start
+                offset=0.6,                 # Lower threshold for speech end
+                pad_onset=0.05,             # Small padding at start
+                pad_offset=0.0,             # No padding at end
+                min_duration_on=0.2,        # Minimum speech duration 200ms
+                min_duration_off=0.2,       # Minimum silence duration 200ms
+            )
+
+            # Convert to segment format
+            segments = []
+            for seg in vad_segments:
+                segments.append({
+                    "start": float(seg[0]),
+                    "end": float(seg[1]),
+                    "type": "speech"
+                })
+
+            logger.info(f"VAD extraction completed: {len(segments)} speech segments from {duration:.2f}s audio")
+
+            return segments
+
+        except Exception as e:
+            logger.error(f"VAD extraction failed: {e}")
+            logger.warning("Falling back to full audio duration")
+
+            # Fallback: return full audio as single segment
+            import librosa
+            duration = librosa.get_duration(filename=audio_path)
+            return [{"start": 0.0, "end": duration, "type": "speech"}]
+
+    def _detect_overlapping_speech(
+        self,
+        diarization_segments: List[Dict],
+        time_threshold: float = 0.1
+    ) -> List[Dict]:
+        """
+        Detect overlapping speech regions where multiple speakers talk simultaneously.
+
+        Args:
+            diarization_segments: Speaker segments from diarization
+            time_threshold: Minimum overlap duration to consider (seconds)
+
+        Returns:
+            List of overlap segments with participating speakers
+        """
+        overlaps = []
+
+        # Sort segments by start time
+        sorted_segments = sorted(diarization_segments, key=lambda x: x["start"])
+
+        for i, seg1 in enumerate(sorted_segments):
+            for seg2 in sorted_segments[i+1:]:
+                # Check for overlap
+                overlap_start = max(seg1["start"], seg2["start"])
+                overlap_end = min(seg1["end"], seg2["end"])
+                overlap_duration = overlap_end - overlap_start
+
+                if overlap_duration >= time_threshold:
+                    # Found overlapping speech
+                    speakers = sorted([seg1["speaker"], seg2["speaker"]])
+                    overlaps.append({
+                        "start": overlap_start,
+                        "end": overlap_end,
+                        "duration": overlap_duration,
+                        "speakers": speakers,
+                        "type": "overlap"
+                    })
+
+        logger.info(f"Detected {len(overlaps)} overlapping speech regions")
+        return overlaps
+
     def _diarize_nemo_sync(self, audio_path: str) -> Dict:
         """
         Diarize using NeMo ClusteringDiarizer (synchronous version for thread pool).
@@ -100,7 +203,7 @@ class DiarizationEngine:
             audio_path: Path to audio file
 
         Returns:
-            Dictionary with segments and metadata
+            Dictionary with segments, VAD segments, overlaps, and metadata
         """
         try:
             logger.info("Starting NeMo diarization...")
@@ -161,13 +264,26 @@ class DiarizationEngine:
                 # Fallback: create a single speaker for entire audio
                 segments = [{"start": 0.0, "end": 10.0, "speaker": "SPEAKER_00"}]
 
+            # Extract VAD segments separately for finer control
+            logger.info("Extracting VAD segments for precise speech boundaries...")
+            vad_segments = self._extract_vad_segments(audio_path)
+
+            # Detect overlapping speech
+            logger.info("Detecting overlapping speech regions...")
+            overlaps = self._detect_overlapping_speech(segments)
+
             logger.info(f"NeMo diarization completed: {len(segments)} segments, {len(set(s['speaker'] for s in segments))} speakers")
+            logger.info(f"VAD extracted: {len(vad_segments)} speech segments")
+            logger.info(f"Overlaps detected: {len(overlaps)} regions")
 
             return {
                 "segments": segments,
+                "vad_segments": vad_segments,  # NEW: Separate VAD for chunking
+                "overlaps": overlaps,          # NEW: Overlapping speech regions
                 "method": "nemo",
                 "device": self.device,
-                "num_speakers": len(set(s['speaker'] for s in segments))
+                "num_speakers": len(set(s['speaker'] for s in segments)),
+                "vad_enabled": True
             }
 
         except Exception as e:
@@ -175,11 +291,20 @@ class DiarizationEngine:
             logger.warning("Falling back to simple single-speaker segmentation")
 
             # Fallback: return single speaker
+            import librosa
+            try:
+                duration = librosa.get_duration(filename=audio_path)
+            except:
+                duration = 10.0
+
             return {
-                "segments": [{"start": 0.0, "end": 10.0, "speaker": "SPEAKER_00"}],
+                "segments": [{"start": 0.0, "end": duration, "speaker": "SPEAKER_00"}],
+                "vad_segments": [{"start": 0.0, "end": duration, "type": "speech"}],
+                "overlaps": [],
                 "method": "fallback",
                 "device": "none",
-                "num_speakers": 1
+                "num_speakers": 1,
+                "vad_enabled": False
             }
 
     async def diarize(self, audio_path: str) -> Dict:

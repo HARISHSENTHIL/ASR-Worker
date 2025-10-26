@@ -184,13 +184,16 @@ class JobProcessor:
                 raise RuntimeError("Transcription manager not initialized")
 
             # Transcribe using the manager (routes to appropriate engine)
+            # Pass VAD segments and overlaps for improved accuracy
             transcription_result = loop.run_until_complete(
                 self.transcription_manager.transcribe(
                     audio_path=request.file_path,
                     source_language=request.source_language or "auto",
                     target_language=request.target_language or "en",
                     accurate_mode=request.accurate_mode,
-                    diarization_segments=diarization_result.get("segments", [])
+                    diarization_segments=diarization_result.get("segments", []),
+                    vad_segments=diarization_result.get("vad_segments", []),
+                    overlaps=diarization_result.get("overlaps", [])
                 )
             )
 
