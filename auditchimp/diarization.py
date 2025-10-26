@@ -51,11 +51,17 @@ class DiarizationEngine:
 
         # NeMo diarizer configuration
         config = {
-            'device': self.device,  # Add device configuration
+            'device': self.device,
+            'num_workers': 0 if self.device == 'cpu' else 2,
+            'sample_rate': 16000,
+            'batch_size': 1,  # Use 1 for Mac CPU
+            'verbose': False,  # Reduce log noise
             'diarizer': {
                 'manifest_filepath': None,  # Will be set per audio file
                 'out_dir': str(self.config.TEMP_DIR),
                 'oracle_vad': False,
+                'num_workers': 0 if self.device == 'cpu' else 2,  # CPU-safe workers
+                'sample_rate': 16000,  # Audio sample rate
                 'clustering': {
                     'parameters': {
                         'oracle_num_speakers': False,
@@ -195,6 +201,37 @@ class DiarizationEngine:
         logger.info(f"Detected {len(overlaps)} overlapping speech regions")
         return overlaps
 
+    import torchaudio
+    import torch
+    from pathlib import Path
+    def _ensure_mono_audio(self, audio_path: str) -> str:
+        """
+        Ensure audio is mono (NeMo requires mono input). If stereo, convert to mono.
+        Returns path to the (possibly converted) audio file.
+        """
+        try:
+            waveform, sample_rate = torchaudio.load(audio_path)
+
+            # Ensure waveform is 2D [channels, time]
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0)
+
+            # Convert stereo → mono by averaging channels
+            if waveform.shape[0] > 1:
+                logger.info(f"Converting stereo ({waveform.shape[0]}ch) to mono...")
+                waveform = waveform.mean(dim=0, keepdim=True)
+
+            # Normalize to prevent clipping
+            waveform = waveform / waveform.abs().max()
+
+            mono_path = Path(self.config.TEMP_DIR) / f"{Path(audio_path).stem}_mono.wav"
+            torchaudio.save(str(mono_path), waveform, sample_rate)
+            return str(mono_path)
+
+        except Exception as e:
+            logger.warning(f"Failed to ensure mono audio: {e}. Using original file.")
+            return audio_path
+    
     def _diarize_nemo_sync(self, audio_path: str) -> Dict:
         """
         Diarize using NeMo ClusteringDiarizer (synchronous version for thread pool).
@@ -208,12 +245,16 @@ class DiarizationEngine:
         try:
             logger.info("Starting NeMo diarization...")
 
+            # Convert to mono if stereo (NeMo requires mono audio)
+            import torchaudio
+            mono_audio_path = self._ensure_mono_audio(audio_path)
+
             # Create temporary manifest file
-            manifest_path = Path(self.config.TEMP_DIR) / f"{Path(audio_path).stem}_manifest.json"
+            manifest_path = Path(self.config.TEMP_DIR) / f"{Path(mono_audio_path).stem}_manifest.json"
 
             # Create manifest entry
             manifest_data = {
-                "audio_filepath": str(audio_path),
+                "audio_filepath": str(mono_audio_path),
                 "offset": 0,
                 "duration": None,
                 "label": "infer",
