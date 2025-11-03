@@ -1,12 +1,13 @@
 """Speaker diarization module using NeMo MSDD for GPU processing."""
 
 import asyncio
-import logging
-import tempfile
 import json
+import logging
 from typing import Dict, List, Optional
 from pathlib import Path
 import torch
+
+from .logger import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -22,25 +23,22 @@ class DiarizationEngine:
     async def initialize(self):
         """Initialize NeMo diarization models."""
         try:
-            logger.info("Initializing NeMo diarization pipeline...")
+            log_event(logger, "info", "diarization_init_started", "Initializing NeMo diarization pipeline", device=self.device)
 
             # Import NeMo dependencies
             from nemo.collections.asr.models import ClusteringDiarizer
             from nemo.collections.asr.parts.utils.speaker_utils import rttm_to_labels
 
-            logger.info(f"Using device: {self.device}")
-
             # Initialize NeMo ClusteringDiarizer
-            # This handles VAD, speaker embedding, and clustering automatically
             self.msdd_model = ClusteringDiarizer(cfg=self._get_diarizer_config())
 
-            logger.info("NeMo diarization pipeline initialized successfully")
+            log_event(logger, "success", "diarization_init_completed", "NeMo diarization pipeline initialized", device=self.device)
 
         except ImportError as e:
-            logger.error(f"NeMo not installed. Install with: pip install nemo_toolkit[asr]")
+            log_event(logger, "error", "diarization_init_failed", "NeMo not installed", error=str(e))
             raise RuntimeError(f"NeMo not available: {e}")
         except Exception as e:
-            logger.error(f"Failed to initialize NeMo diarization: {e}")
+            log_event(logger, "error", "diarization_init_failed", "Failed to initialize NeMo diarization", error=str(e))
             raise
 
     def _get_diarizer_config(self):
@@ -50,10 +48,10 @@ class DiarizationEngine:
         # Complete NeMo diarizer configuration following official structure
         config = {
             'device': self.device,
-            'num_workers': 0 if self.device == 'cpu' else 2,
+            'num_workers': 0,  # Force 0 to avoid shared memory issues
             'sample_rate': 16000,
             'batch_size': 1,
-            'verbose': True,  # Enable verbose logging to debug
+            'verbose': False,  # Disable verbose to reduce NeMo logs
             'diarizer': {
                 # Core diarizer settings
                 'manifest_filepath': None,  # Set per audio file
@@ -62,8 +60,8 @@ class DiarizationEngine:
                 'collar': 0.25,  # Collar value for scoring tolerance
                 'ignore_overlap': True,  # Ignore overlap segments in scoring
 
-                # Worker settings
-                'num_workers': 0 if self.device == 'cpu' else 2,
+                # Worker settings - Force 0 to avoid shared memory issues
+                'num_workers': 0,
                 'sample_rate': 16000,
 
                 # VAD Configuration
@@ -158,12 +156,10 @@ class DiarizationEngine:
             # Don't forget the last segment
             vad_segments.append(current_segment)
 
-            logger.info(f"Extracted {len(vad_segments)} VAD segments from {len(diarization_segments)} diarization segments")
-
             return vad_segments
 
         except Exception as e:
-            logger.error(f"VAD extraction failed: {e}")
+            log_event(logger, "warning", "vad_extraction_failed", "VAD extraction failed, using fallback", error=str(e))
             # Return diarization segments as-is if extraction fails
             return [{"start": s["start"], "end": s["end"], "type": "speech"}
                     for s in diarization_segments]
@@ -206,7 +202,6 @@ class DiarizationEngine:
                         "type": "overlap"
                     })
 
-        logger.info(f"Detected {len(overlaps)} overlapping speech regions")
         return overlaps
 
     def _diarize_nemo_sync(self, audio_path: str) -> Dict:
@@ -220,8 +215,6 @@ class DiarizationEngine:
             Dictionary with segments, VAD segments, overlaps, and metadata
         """
         try:
-            logger.info("Starting NeMo diarization...")
-
             # Convert to mono 16kHz if needed (NeMo requires mono audio at 16kHz)
             import librosa
             import soundfile as sf
@@ -229,7 +222,6 @@ class DiarizationEngine:
             import uuid
 
             # Load audio and convert to mono 16kHz
-            logger.info(f"Loading audio file: {audio_path}")
             audio, sr = librosa.load(audio_path, sr=16000, mono=True)
 
             # Create unique output directory for this diarization run to avoid conflicts
@@ -239,12 +231,16 @@ class DiarizationEngine:
 
             # Save as temporary mono file
             mono_audio_path = output_dir / f"{Path(audio_path).stem}_mono.wav"
-            sf.write(mono_audio_path, audio, 16000)
-            logger.info(f"Converted to mono 16kHz: {mono_audio_path}")
+            sf.write(str(mono_audio_path), audio, 16000, format='WAV', subtype='PCM_16')
 
             # Get audio duration
             duration = librosa.get_duration(y=audio, sr=16000)
-            logger.info(f"Audio duration: {duration:.2f}s")
+            log_event(
+                logger, "info", "audio_preprocessing_completed", "Audio preprocessed for diarization",
+                duration_sec=round(duration, 2),
+                sample_rate=16000,
+                channels=1
+            )
 
             # Clean up NeMo output directories if they exist (prevents "File exists" errors)
             nemo_dirs = ['speaker_outputs', 'pred_rttms']
@@ -274,47 +270,43 @@ class DiarizationEngine:
                 json.dump(manifest_data, f)
                 f.write('\n')
 
-            logger.info(f"Created manifest file: {manifest_path}")
-            logger.info(f"Manifest content: {manifest_data}")
-
             # Verify audio file exists
             if not mono_audio_path.exists():
                 raise FileNotFoundError(f"Mono audio file not found: {mono_audio_path}")
-            logger.info(f"Mono audio file exists: {mono_audio_path} ({mono_audio_path.stat().st_size} bytes)")
 
             # Update config with manifest path and unique output directory
             self.msdd_model._cfg.diarizer.manifest_filepath = str(manifest_path)
             self.msdd_model._cfg.diarizer.out_dir = str(output_dir)
 
-            logger.info(f"Updated diarizer config:")
-            logger.info(f"  - manifest_filepath: {self.msdd_model._cfg.diarizer.manifest_filepath}")
-            logger.info(f"  - out_dir: {self.msdd_model._cfg.diarizer.out_dir}")
-            logger.info(f"  - oracle_vad: {self.msdd_model._cfg.diarizer.oracle_vad}")
-            logger.info(f"  - clustering params: {self.msdd_model._cfg.diarizer.clustering.parameters}")
-
             # Run diarization
-            logger.info("Running NeMo diarization...")
+            log_event(logger, "info", "nemo_diarization_started", "NeMo diarization execution started")
             self.msdd_model.diarize()
-            logger.info("Diarization completed, reading results...")
+            log_event(logger, "info", "nemo_diarization_processing", "NeMo diarization completed, reading results")
 
             # NeMo saves RTTM output to pred_rttms subdirectory
             # The filename uses the base name from the audio file in the manifest
             pred_rttms_dir = output_dir / "pred_rttms"
-            rttm_filename = f"{Path(audio_path).stem}_mono.rttm"
-            rttm_path = pred_rttms_dir / rttm_filename
 
-            logger.info(f"Looking for RTTM file at: {rttm_path}")
-            logger.info(f"pred_rttms directory exists: {pred_rttms_dir.exists()}")
+            # Find RTTM file - NeMo might use different naming conventions
+            rttm_path = None
             if pred_rttms_dir.exists():
-                logger.info(f"Contents of pred_rttms: {list(pred_rttms_dir.iterdir())}")
+                # Try exact match first
+                expected_rttm = pred_rttms_dir / f"{Path(audio_path).stem}_mono.rttm"
+                if expected_rttm.exists():
+                    rttm_path = expected_rttm
+                else:
+                    # Search for any .rttm file in the directory
+                    rttm_files = list(pred_rttms_dir.glob("*.rttm"))
+                    if rttm_files:
+                        rttm_path = rttm_files[0]
+                        log_event(logger, "info", "rttm_found_alternative", "RTTM file found with alternative name",
+                                 expected=str(expected_rttm), found=str(rttm_path))
 
             segments = []
             unique_speakers = set()
-            if rttm_path.exists():
-                logger.info(f"Reading RTTM file: {rttm_path}")
+            if rttm_path and rttm_path.exists():
                 with open(rttm_path, 'r') as f:
                     rttm_content = f.read()
-                    logger.info(f"RTTM content:\n{rttm_content}")
 
                     # Parse RTTM lines
                     for line in rttm_content.strip().split('\n'):
@@ -333,60 +325,63 @@ class DiarizationEngine:
                                 "speaker": speaker
                             })
 
-                logger.info(f"Detected {len(unique_speakers)} unique speakers: {unique_speakers}")
+                log_event(
+                    logger, "info", "speakers_detected", "Speaker detection from RTTM completed",
+                    num_speakers=len(unique_speakers),
+                    segments=len(segments),
+                    speakers=list(unique_speakers)
+                )
             else:
-                logger.error(f"RTTM file not found at: {rttm_path}")
-                logger.error(f"Output directory contents: {list(output_dir.iterdir()) if output_dir.exists() else 'directory does not exist'}")
+                search_path = str(pred_rttms_dir) if pred_rttms_dir.exists() else str(output_dir)
+                log_event(logger, "warning", "rttm_not_found", "RTTM file not found", search_path=search_path)
 
             # Clean up entire output directory with all temp files
             try:
                 shutil.rmtree(output_dir)
-                logger.debug(f"Cleaned up temporary directory: {output_dir}")
             except Exception as e:
-                logger.warning(f"Failed to clean up temp directory {output_dir}: {e}")
+                log_event(logger, "warning", "cleanup_failed", "Failed to clean up temp directory", error=str(e))
 
             if not segments:
-                logger.warning("No speakers detected, creating single speaker segment")
-                # Fallback: create a single speaker for entire audio
+                log_event(logger, "warning", "no_speakers_detected", "No speakers detected, using fallback")
                 segments = [{"start": 0.0, "end": duration, "speaker": "SPEAKER_00"}]
 
             # Extract VAD segments from diarization results
-            logger.info("Extracting VAD segments from diarization results...")
             vad_segments = self._extract_vad_segments_from_diarization(segments)
 
             # Detect overlapping speech
-            logger.info("Detecting overlapping speech regions...")
             overlaps = self._detect_overlapping_speech(segments)
 
             num_speakers = len(set(s['speaker'] for s in segments))
-            logger.info(f"NeMo diarization completed: {len(segments)} segments, {num_speakers} speakers")
-            logger.info(f"Speakers found: {set(s['speaker'] for s in segments)}")
-            logger.info(f"VAD extracted: {len(vad_segments)} speech segments")
-            logger.info(f"Overlaps detected: {len(overlaps)} regions")
 
             result = {
                 "segments": segments,
-                "vad_segments": vad_segments,  # Separate VAD for chunking
-                "overlaps": overlaps,          # Overlapping speech regions
+                "vad_segments": vad_segments,
+                "overlaps": overlaps,
                 "method": "nemo",
                 "device": self.device,
                 "num_speakers": num_speakers,
                 "vad_enabled": True
             }
 
-            logger.info(f"Returning diarization result with {num_speakers} speakers")
             return result
 
         except Exception as e:
-            logger.error(f"NeMo diarization failed: {e}")
-            logger.warning("Falling back to simple single-speaker segmentation")
+            log_event(logger, "error", "diarization_failed", "NeMo diarization failed, using fallback", error=str(e))
 
             # Fallback: return single speaker
             import librosa
+            import soundfile as sf
             try:
-                duration = librosa.get_duration(filename=audio_path)
+                # Try soundfile first (more reliable for various formats)
+                info = sf.info(audio_path)
+                duration = info.duration
             except:
-                duration = 10.0
+                try:
+                    # Fall back to librosa with explicit loading
+                    y, sr = librosa.load(audio_path, sr=None)
+                    duration = librosa.get_duration(y=y, sr=sr)
+                except:
+                    duration = 0.0
 
             return {
                 "segments": [{"start": 0.0, "end": duration, "speaker": "SPEAKER_00"}],

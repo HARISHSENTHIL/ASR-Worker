@@ -1,26 +1,13 @@
 """Main entry point for the AudioChimp API."""
 
-import asyncio
-import logging
 import sys
-from pathlib import Path
-
+import logging
 from .config import config
+from .logger import setup_logging, log_event
 from .api import app
 
-# Ensure log directory exists
-log_dir = Path(config.LOG_FILE).parent
-log_dir.mkdir(exist_ok=True)
-
 # Configure logging
-logging.basicConfig(
-    level=getattr(logging, config.LOG_LEVEL),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(config.LOG_FILE),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+setup_logging(config.LOG_FILE, config.LOG_LEVEL)
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +15,15 @@ logger = logging.getLogger(__name__)
 def main():
     """Main entry point."""
     try:
-        logger.info("Starting AudioChimp API server...")
-        logger.info(f"Configuration: Model={config.WHISPER_MODEL}, Quantization={config.QUANTIZATION}")
-        logger.info(f"API will be available at http://{config.API_HOST}:{config.API_PORT}")
+        log_event(
+            logger, "info", "api_startup",
+            "AudioChimp API server starting",
+            model=config.MODEL_NAME,
+            compute_type=config.MODEL_COMPUTE_TYPE,
+            host=config.API_HOST,
+            port=config.API_PORT
+        )
 
-        # Import and run the FastAPI app
         import uvicorn
 
         uvicorn.run(
@@ -41,13 +32,15 @@ def main():
             port=config.API_PORT,
             workers=config.API_WORKERS,
             reload=False,
-            access_log=True
+            access_log=True,
+            timeout_keep_alive=120,
+            timeout_graceful_shutdown=30
         )
 
     except KeyboardInterrupt:
-        logger.info("Shutting down AudioChimp API...")
+        log_event(logger, "info", "api_shutdown", "AudioChimp API shutting down")
     except Exception as e:
-        logger.error(f"Error starting AudioChimp API: {e}")
+        log_event(logger, "error", "api_startup_failed", "Failed to start AudioChimp API", error=str(e))
         sys.exit(1)
 
 

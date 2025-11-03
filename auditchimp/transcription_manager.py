@@ -4,8 +4,9 @@ import asyncio
 import logging
 from typing import Dict, List, Optional
 
-from .transcription import TranscriptionEngine as WhisperEngine
+from .transcription_parakeet import ParakeetTranscriber
 from .transcription_indic import IndicConformerEngine
+from .logger import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -16,16 +17,16 @@ class TranscriptionEngineManager:
 
     Routing Logic:
     - IndicConformer: For Indian language transcription (same language in/out)
-    - Whisper: For translation to English or unsupported languages
+    - Parakeet: For translation to English or unsupported languages
     """
 
     def __init__(self, config):
         self.config = config
-        self.whisper_engine = None
+        self.parakeet_engine = None
         self.indic_engine = None
 
-        # Preload configuration
-        self.preload_whisper = config.PRELOAD_WHISPER
+        # Preload configuration (from environment)
+        self.preload_parakeet = config.PRELOAD_PARAKEET
         self.preload_indic = config.PRELOAD_INDIC_CONFORMER
         self.enable_indic = config.ENABLE_INDIC_CONFORMER
 
@@ -38,100 +39,77 @@ class TranscriptionEngineManager:
 
     async def initialize(self):
         """Initialize engines based on preload configuration."""
-        logger.info("Initializing TranscriptionEngineManager...")
+        log_event(logger, "info", "transcription_manager_init_started", "TranscriptionEngineManager initialization started")
 
-        # Preload Whisper if configured
-        if self.preload_whisper:
-            await self._load_whisper()
-        else:
-            logger.info("Whisper engine set to lazy load")
+        # Preload Parakeet
+        if self.preload_parakeet:
+            await self._load_parakeet()
 
         # Preload IndicConformer if configured and enabled
         if self.enable_indic and self.preload_indic:
             await self._load_indic()
-        elif self.enable_indic:
-            logger.info("IndicConformer engine set to lazy load")
-        else:
-            logger.info("IndicConformer engine disabled")
 
-        logger.info("TranscriptionEngineManager initialized successfully")
+        log_event(logger, "success", "transcription_manager_init_completed", "TranscriptionEngineManager initialized")
 
-    async def _load_whisper(self):
-        """Lazy load Whisper engine."""
-        if not self.whisper_engine:
-            logger.info("Loading Whisper engine...")
-            self.whisper_engine = WhisperEngine(self.config)
-            await self.whisper_engine.initialize()
-            logger.info("Whisper engine loaded successfully")
-        return self.whisper_engine
+    async def _load_parakeet(self):
+        """Lazy load Parakeet engine."""
+        if not self.parakeet_engine:
+            log_event(logger, "info", "parakeet_loading", "Loading Parakeet engine")
+            self.parakeet_engine = ParakeetTranscriber(
+                model_name=self.config.MODEL_NAME,
+                device=self.config.MODEL_DEVICE,
+                compute_type=self.config.MODEL_COMPUTE_TYPE,
+                batch_size=self.config.BATCH_SIZE
+            )
+            await self.parakeet_engine.initialize()
+            log_event(logger, "success", "parakeet_loaded", "Parakeet engine loaded")
+        return self.parakeet_engine
 
     async def _load_indic(self):
         """Lazy load IndicConformer engine."""
         if not self.indic_engine:
-            logger.info("Loading IndicConformer engine...")
+            log_event(logger, "info", "indic_loading", "Loading IndicConformer engine")
             self.indic_engine = IndicConformerEngine(self.config)
             await self.indic_engine.initialize()
-            logger.info("IndicConformer engine loaded successfully")
+            log_event(logger, "success", "indic_loaded", "IndicConformer engine loaded")
         return self.indic_engine
 
-    def _should_use_indic_conformer(
-        self,
-        source_lang: str,
-        target_lang: str
-    ) -> bool:
+    def _should_use_indic_conformer(self, source_lang: str) -> bool:
         """
         Determine if IndicConformer should be used for this request.
 
         IndicConformer is used when:
         1. It's enabled in configuration
         2. Source language is an Indian language
-        3. Target language equals source (transcription, not translation)
 
         Args:
             source_lang: Source language code
-            target_lang: Target language code
 
         Returns:
             True if IndicConformer should be used, False otherwise
         """
-        return (
-            self.enable_indic and
-            source_lang in self.indic_languages and
-            target_lang == source_lang  # Same language = transcription only
-        )
+        return self.enable_indic and source_lang in self.indic_languages
 
-    def _resolve_language(
-        self,
-        source_language: str,
-        target_language: str
-    ) -> tuple[str, str]:
+    def _get_output_language(self, source_lang: str) -> str:
         """
-        Resolve auto language settings to actual language codes.
+        Determine the output language based on the source language.
+
+        IMPORTANT: Both IndicConformer and Parakeet only do transcription (NOT translation).
+        Output is always in the same language as input.
 
         Args:
-            source_language: Source language (may be "auto")
-            target_language: Target language (may be "auto")
+            source_lang: Source language code
 
         Returns:
-            Tuple of (resolved_source, resolved_target)
+            Output language code (always same as source language)
         """
-        # If target is auto, determine based on source
-        if target_language == "auto":
-            if source_language in self.indic_languages:
-                # Indian language: default to same language (transcription)
-                target_language = source_language
-            else:
-                # Other languages: default to English (translation)
-                target_language = "en"
-
-        return source_language, target_language
+        # Both engines transcribe in the same language as the source
+        return source_lang
 
     async def transcribe(
         self,
         audio_path: str,
         source_language: str = "auto",
-        target_language: str = "auto",
-        accurate_mode: bool = False,
         diarization_segments: Optional[List[Dict]] = None,
         vad_segments: Optional[List[Dict]] = None,
         overlaps: Optional[List[Dict]] = None
@@ -139,14 +117,16 @@ class TranscriptionEngineManager:
         """
         Transcribe audio using the appropriate engine with VAD-based chunking.
 
-        Routes to IndicConformer for Indian language transcription,
-        Whisper for translation or unsupported languages.
+        Language Handling:
+        - Indian languages (ta, te, kn, ml, hi, etc.): Uses IndicConformer → transcribes in source language
+        - European languages (en, de, fr, es, etc.): Uses Parakeet → transcribes in source language
+
+        IMPORTANT: Both engines only do transcription, NOT translation.
+        Output is always in the same language as input.
 
         Args:
             audio_path: Path to audio file
             source_language: Source language code or "auto"
-            target_language: Target language code or "auto"
-            accurate_mode: Whether to use accurate mode (Whisper only)
             diarization_segments: Optional speaker diarization segments
             vad_segments: Optional VAD segments for precise chunking
             overlaps: Optional overlapping speech regions
@@ -155,27 +135,29 @@ class TranscriptionEngineManager:
             Dictionary containing transcription results and metadata
         """
         try:
-            # Resolve auto language settings
-            source_lang, target_lang = self._resolve_language(
-                source_language,
-                target_language
-            )
+            # Handle auto language detection
+            if source_language == "auto":
+                # Default to Parakeet (English) for auto-detection
+                # Parakeet has built-in language detection
+                source_lang = "en"
+                use_indic = False
+                logger.info("Auto language detection: defaulting to Parakeet (English)")
+            else:
+                source_lang = source_language
+                use_indic = self._should_use_indic_conformer(source_lang)
 
-            # Determine which engine to use
-            use_indic = self._should_use_indic_conformer(source_lang, target_lang)
+            # Output is always same as source (both engines only transcribe)
+            output_lang = self._get_output_language(source_lang)
 
             if use_indic:
-                # Use IndicConformer for Indian language transcription
-                logger.info(
-                    f"Routing to IndicConformer: {source_lang} → {target_lang} (transcription)"
-                )
+                # Use IndicConformer for Indian languages
+                log_event(logger, "info", "routing_to_indic", "Routing to IndicConformer", language=source_lang)
 
                 # Lazy load if not preloaded
                 await self._load_indic()
 
                 # Use VAD-based chunking if VAD segments are available
                 if vad_segments:
-                    logger.info(f"Using VAD-based chunking with {len(vad_segments)} speech segments")
                     result = await self.indic_engine.transcribe_with_vad_chunking(
                         audio_path=audio_path,
                         language=source_lang,
@@ -184,8 +166,6 @@ class TranscriptionEngineManager:
                         overlaps=overlaps
                     )
                 else:
-                    # Fallback to time-based chunking
-                    logger.info("Using time-based chunking (no VAD segments provided)")
                     result = await self.indic_engine.transcribe_with_chunking(
                         audio_path=audio_path,
                         language=source_lang,
@@ -197,39 +177,32 @@ class TranscriptionEngineManager:
                 # Add engine metadata
                 result["engine"] = "indic-conformer"
                 result["source_language"] = source_lang
-                result["target_language"] = target_lang
+                result["output_language"] = output_lang
                 result["translation_enabled"] = False
 
             else:
-                # Use Whisper for translation or unsupported languages
-                reason = "translation" if source_lang != target_lang else "unsupported language"
-                logger.info(
-                    f"Routing to Whisper: {source_lang} → {target_lang} ({reason})"
-                )
+                # Use Parakeet for European languages
+                log_event(logger, "info", "routing_to_parakeet", "Routing to Parakeet", language=source_lang)
 
                 # Lazy load if not preloaded
-                await self._load_whisper()
+                await self._load_parakeet()
 
-                result = await self.whisper_engine.transcribe(
+                result = await self.parakeet_engine.transcribe(
                     audio_path=audio_path,
-                    accurate_mode=accurate_mode,
-                    diarization_segments=diarization_segments,
-                    source_language=source_lang,
-                    target_language=target_lang
+                    language=source_lang,
+                    task="transcribe"
                 )
 
                 # Add engine metadata
-                result["engine"] = "whisper"
-
-            logger.info(
-                f"Transcription completed using {result['engine']}: "
-                f"{len(result.get('segments', []))} segments"
-            )
+                result["engine"] = "parakeet"
+                result["source_language"] = source_lang
+                result["output_language"] = output_lang
+                result["translation_enabled"] = False
 
             return result
 
         except Exception as e:
-            logger.error(f"Transcription failed: {e}")
+            log_event(logger, "error", "transcription_failed", "Transcription failed", error=str(e))
             raise
 
     async def get_supported_languages(self) -> Dict[str, List[str]]:
@@ -240,9 +213,19 @@ class TranscriptionEngineManager:
             Dictionary mapping engine names to language lists
         """
         return {
-            "whisper": [
-                "en", "ar", "ta", "te", "kn", "ml", "hi", "bn",
-                "and 90+ other languages"
+            "parakeet": [
+                # Germanic languages
+                "en", "de", "nl", "sv",
+                # Romance languages
+                "fr", "it", "pt", "es", "ro",
+                # Slavic languages
+                "bg", "hr", "cs", "pl", "ru", "sk", "sl", "uk",
+                # Other Indo-European
+                "da", "el", "lt", "lv",
+                # Uralic languages
+                "et", "fi", "hu",
+                # Other EU languages
+                "mt"
             ],
             "indic_conformer": self.indic_languages if self.enable_indic else []
         }
@@ -255,9 +238,9 @@ class TranscriptionEngineManager:
             Dictionary with engine loading status
         """
         return {
-            "whisper": {
-                "loaded": self.whisper_engine is not None,
-                "preload": self.preload_whisper
+            "parakeet": {
+                "loaded": self.parakeet_engine is not None,
+                "preload": self.preload_parakeet
             },
             "indic_conformer": {
                 "enabled": self.enable_indic,

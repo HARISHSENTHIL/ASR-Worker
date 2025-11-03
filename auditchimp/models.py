@@ -35,12 +35,11 @@ class TranscriptionRequest(Base):
 
     # Processing options
     accurate_mode = Column(Boolean, default=False, nullable=False)
-    quantization = Column(Boolean, default=True, nullable=False)
     file_hash = Column(String(128), nullable=True)  # SHA-256 hash of the uploaded file
 
     # Language settings
     source_language = Column(String(10), nullable=True, default="auto")  # Source language code
-    target_language = Column(String(10), nullable=True, default="en")    # Target language code
+    output_language = Column(String(10), nullable=True)                  # Output language code (always same as source - both engines only transcribe)
     detected_language = Column(String(10), nullable=True)                # Actually detected language
     detected_language_name = Column(String(50), nullable=True)           # Human-readable name
 
@@ -62,6 +61,8 @@ class TranscriptionRequest(Base):
 
     # Processing metadata
     processing_time = Column(Float, nullable=True)  # Total processing time in seconds
+    diarization_time = Column(Float, nullable=True)  # Diarization processing time in seconds
+    transcription_time = Column(Float, nullable=True)  # Transcription processing time in seconds
     whisper_model = Column(String(50), nullable=True)
     diarization_method = Column(String(50), nullable=True)  # 'nemo' or 'pyannote'
 

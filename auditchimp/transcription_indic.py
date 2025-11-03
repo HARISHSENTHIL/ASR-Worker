@@ -6,6 +6,8 @@ from typing import Dict, List, Optional
 import torch
 import torchaudio
 
+from .logger import log_event
+
 logger = logging.getLogger(__name__)
 
 
@@ -20,6 +22,23 @@ class IndicConformerEngine:
     def __init__(self, config):
         self.config = config
         self.model = None
+
+        # Handle device selection with proper "auto" detection
+        device = config.INDIC_DEVICE
+        if device == "auto" or device is None:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        elif device in ["cuda", "cpu"]:
+            # Validate CUDA availability if explicitly requested
+            if device == "cuda" and not torch.cuda.is_available():
+                logger.warning("CUDA requested but not available, falling back to CPU")
+                self.device = "cpu"
+            else:
+                self.device = device
+        else:
+            logger.warning(f"Invalid device '{device}', defaulting to auto-detection")
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        logger.info(f"IndicConformer will use device: {self.device}")
 
         # Languages supported by IndicConformer
         self.supported_languages = [
@@ -56,7 +75,7 @@ class IndicConformerEngine:
     async def initialize(self):
         """Initialize the IndicConformer model."""
         try:
-            logger.info("Initializing IndicConformer model...")
+            log_event(logger, "info", "indic_init_started", "Initializing IndicConformer model", device=self.device)
 
             from transformers import AutoModel
 
@@ -69,18 +88,30 @@ class IndicConformerEngine:
             # Add token if available (required for gated models)
             if self.config.HF_TOKEN:
                 model_kwargs["token"] = self.config.HF_TOKEN
-                logger.info("Using Hugging Face token for gated model access")
 
             self.model = AutoModel.from_pretrained(
                 "ai4bharat/indic-conformer-600m-multilingual",
                 **model_kwargs
             )
 
-            logger.info("IndicConformer model initialized successfully")
-            logger.info(f"Supported languages: {', '.join(self.supported_languages)}")
+            # Move model to GPU if configured
+            if self.device == "cuda":
+                self.model = self.model.cuda()
+                # Set model to eval mode for inference
+                self.model.eval()
+
+                # Optional: Use half precision for faster inference if GPU supports it
+                # Uncomment below for FP16 optimization (requires GPU with Tensor Cores)
+                # self.model = self.model.half()
+
+            log_event(
+                logger, "success", "indic_init_completed", "IndicConformer model initialized",
+                device=self.device,
+                languages=len(self.supported_languages)
+            )
 
         except Exception as e:
-            logger.error(f"Failed to initialize IndicConformer: {e}")
+            log_event(logger, "error", "indic_init_failed", "Failed to initialize IndicConformer", error=str(e))
             raise
 
     def is_language_supported(self, language: str) -> bool:
@@ -109,7 +140,12 @@ class IndicConformerEngine:
             Dictionary containing word-level segments with speaker labels
         """
         try:
-            logger.info(f"Starting VAD-based IndicConformer transcription for language: {language}")
+            log_event(
+                logger, "info", "indic_vad_transcription_started",
+                "Starting VAD-based IndicConformer transcription",
+                language=language,
+                vad_segments=len(vad_segments)
+            )
 
             # Validate language
             if not self.is_language_supported(language):
@@ -134,8 +170,6 @@ class IndicConformerEngine:
                 sr = 16000
 
             total_duration = wav.shape[1] / sr
-            logger.info(f"Total audio duration: {total_duration:.2f}s")
-            logger.info(f"Processing {len(vad_segments)} VAD segments")
 
             # Process each VAD segment (speech-only chunks)
             all_word_segments = []
@@ -154,20 +188,17 @@ class IndicConformerEngine:
                 # Skip very short chunks (< 0.5s)
                 chunk_duration = (end_sample - start_sample) / sr
                 if chunk_duration < 0.5:
-                    logger.debug(f"Skipping very short VAD segment {segment_num} ({chunk_duration:.2f}s)")
                     continue
 
-                logger.info(
-                    f"Processing VAD segment {segment_num}/{len(vad_segments)}: "
-                    f"{start_time:.2f}s - {end_time:.2f}s ({chunk_duration:.2f}s)"
-                )
-
                 try:
+                    # Move chunk to same device as model for GPU acceleration
+                    if self.device == "cuda" and chunk.device.type != 'cuda':
+                        chunk = chunk.cuda()
+
                     # Transcribe VAD segment using RNNT decoder
                     text = self.model(chunk, language, "rnnt")
 
                     if not text.strip():
-                        logger.warning(f"VAD segment {segment_num} produced empty transcription")
                         continue
 
                     # Split into words and create word-level segments
@@ -191,17 +222,19 @@ class IndicConformerEngine:
                             "speaker": None  # Will be assigned later
                         })
 
-                    logger.debug(f"VAD segment {segment_num}: {len(words)} words extracted")
-
                 except Exception as e:
-                    logger.error(f"Error transcribing VAD segment {segment_num}: {e}")
+                    log_event(logger, "warning", "vad_segment_error", "Error transcribing VAD segment", segment=segment_num, error=str(e))
                     continue
 
-            logger.info(f"Transcription completed: {len(all_word_segments)} words from {segment_num} VAD segments")
+            log_event(
+                logger, "success", "indic_vad_transcription_completed",
+                "VAD-based transcription completed",
+                total_words=len(all_word_segments),
+                vad_segments_processed=segment_num
+            )
 
             # Map speakers to word-level segments
             if diarization_segments:
-                logger.info("Mapping speakers to word-level segments...")
                 all_word_segments = self._map_speakers_word_level(
                     all_word_segments,
                     diarization_segments,
@@ -226,11 +259,12 @@ class IndicConformerEngine:
                 "model": "indic-conformer-600m-multilingual",
                 "decoder": "rnnt",
                 "vad_segments_processed": segment_num,
-                "overlaps_detected": len(overlaps) if overlaps else 0
+                "overlaps_detected": len(overlaps) if overlaps else 0,
+                "duration": total_duration
             }
 
         except Exception as e:
-            logger.error(f"VAD-based IndicConformer transcription failed: {e}")
+            log_event(logger, "error", "indic_vad_transcription_failed", "VAD-based transcription failed", error=str(e))
             raise
 
     async def transcribe_with_chunking(
@@ -313,6 +347,10 @@ class IndicConformerEngine:
                 )
 
                 try:
+                    # Move chunk to same device as model for GPU acceleration
+                    if self.device == "cuda" and chunk.device.type != 'cuda':
+                        chunk = chunk.cuda()
+
                     # Transcribe chunk using RNNT decoder (better accuracy)
                     text = self.model(chunk, language, "rnnt")
 
@@ -369,7 +407,8 @@ class IndicConformerEngine:
                 "decoder": "rnnt",
                 "chunk_duration": chunk_duration,
                 "overlap": overlap,
-                "total_chunks": chunk_num
+                "total_chunks": chunk_num,
+                "duration": total_duration
             }
 
         except Exception as e:

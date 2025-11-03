@@ -8,6 +8,7 @@ import hashlib
 import os
 from datetime import datetime
 from typing import Dict, List, Optional
+from math import ceil
 from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Depends, Request
@@ -18,6 +19,7 @@ from sqlalchemy.orm import Session
 from .models import TranscriptionRequest, ProcessingStatus, init_database
 from .config import config
 from .processor import get_processor
+from .utils import safe_delete_audio_file
 
 logger = logging.getLogger(__name__)
 
@@ -79,8 +81,8 @@ async def startup_event():
     SessionLocal = init_database(config.DATABASE_URL)
     db_session = SessionLocal()
 
-    # Initialize processor (this starts the job processor automatically)
-    processor = await get_processor(db_session)
+    # Initialize processor with both session and factory (this starts the job processor automatically)
+    processor = await get_processor(db_session, SessionLocal)
 
     # Create necessary directories
     config.UPLOAD_DIR.mkdir(exist_ok=True)
@@ -88,7 +90,7 @@ async def startup_event():
     config.MODEL_CACHE_DIR.mkdir(exist_ok=True)
 
     # Create logs directory
-    Path(config.LOG_FILE).parent.mkdir(exist_ok=True)
+    # Path(config.LOG_FILE).parent.mkdir(exist_ok=True)
 
     logger.info("AudioChimp API started successfully")
 
@@ -113,46 +115,35 @@ async def submit_audio(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     accurate_mode: bool = False,
-    source_language: str = "auto",
-    target_language: str = "auto"
+    source_language: str = "auto"
 ):
-    """
-    Submit audio file for transcription and diarization.
-
-    Language Detection Priority:
-    1. HTTP headers (X-Source-Language, X-Target-Language)
-    2. Form parameters (source_language, target_language)
-    3. Defaults (auto, auto)
-
-    Target Language Defaults:
-    - If source is Indian language and target is "auto" → same as source (transcription)
-    - Otherwise if target is "auto" → English (translation)
-    """
     try:
-        # Get language parameters with header priority
+        # Get source language parameter with header priority
         source_lang = request.headers.get("X-Source-Language", source_language)
-        target_lang = request.headers.get("X-Target-Language", target_language)
 
-        # Resolve auto target language
-        if target_lang == "auto":
-            # Indian languages default to same language (transcription)
-            if source_lang in ["ta", "te", "kn", "ml", "hi", "bn", "mr", "gu", "pa", "or", "as", "ur"]:
-                target_lang = source_lang
-            else:
-                target_lang = "en"
-
-        # Validate source language
-        if source_lang not in config.SUPPORTED_SOURCE_LANGUAGES:
+        # Determine which model to use based on language
+        if source_lang in config.INDIC_LANGUAGES:
+            # Use IndicConformer for Indian languages
+            use_indic_model = True
+        elif source_lang in config.PARAKEET_LANGUAGES:
+            # Use Parakeet for European languages
+            use_indic_model = False
+        else:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported source language: {source_lang}. Supported: {', '.join(config.SUPPORTED_SOURCE_LANGUAGES)}"
+                detail=f"Unsupported language: {source_lang}. Supported languages: {', '.join(config.SUPPORTED_SOURCE_LANGUAGES)}"
             )
 
-        # Validate target language (currently only English supported for translation)
-        if target_lang != source_lang and target_lang != "en":
+        # Validate source language
+        if use_indic_model and source_lang not in config.INDIC_LANGUAGES:
             raise HTTPException(
                 status_code=400,
-                detail=f"Translation only supported to English. Use target_language='en' or omit for same-language transcription."
+                detail=f"Unsupported Indian language: {source_lang}. Supported: {', '.join(config.INDIC_LANGUAGES)}"
+            )
+        elif not use_indic_model and source_lang not in config.PARAKEET_LANGUAGES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported language: {source_lang}. Supported: {', '.join(config.PARAKEET_LANGUAGES)}"
             )
 
         # Validate file
@@ -196,10 +187,8 @@ async def submit_audio(
             file_path=str(file_path),
             file_size=file_size,
             accurate_mode=accurate_mode,
-            quantization=config.QUANTIZATION,  # Always use config value
             file_hash=file_hash,
             source_language=source_lang,
-            target_language=target_lang,
             status=ProcessingStatus.QUEUED,
             progress=0.0
         )
@@ -207,16 +196,17 @@ async def submit_audio(
         db_session.add(request_obj)
         db_session.commit()
 
+        model_type = "IndicConformer" if use_indic_model else "Parakeet"
         logger.info(
             f"Audio file submitted: {request_id} - {file.filename} "
-            f"(hash: {file_hash[:16]}..., lang: {source_lang}→{target_lang})"
+            f"(hash: {file_hash[:16]}..., lang: {source_lang}, model: {model_type})"
         )
 
         return {
             "request_id": request_id,
             "file_hash": file_hash,
             "source_language": source_lang,
-            "target_language": target_lang,
+            "model": model_type,
             "status": "queued",
             "message": "Audio file submitted successfully",
             "estimated_time": "2-5 minutes depending on file length and processing mode"
@@ -229,9 +219,121 @@ async def submit_audio(
         raise HTTPException(status_code=500, detail=f"Error submitting audio: {str(e)}")
 
 
+@app.get("/status")
+async def get_status_list(
+    page: int = 1,
+    limit: int = 10,
+    status: Optional[str] = None
+):
+    """Get paginated list of transcription requests with optional status filter."""
+    try:
+        # Validate page and limit
+        if page < 1:
+            raise HTTPException(status_code=400, detail="Page must be >= 1")
+        if limit < 1 or limit > 100:
+            raise HTTPException(status_code=400, detail="Limit must be between 1 and 100")
+
+        # Validate status filter if provided
+        if status:
+            valid_statuses = ["queued", "diarizing", "transcribing", "completed", "failed", "canceled"]
+            if status.lower() not in valid_statuses:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}"
+                )
+
+        # Build query
+        query = db_session.query(TranscriptionRequest)
+
+        # Apply status filter if provided
+        if status:
+            query = query.filter(TranscriptionRequest.status == ProcessingStatus(status.lower()))
+
+        # Get total count
+        total_items = query.count()
+
+        # Calculate pagination
+        total_pages = ceil(total_items / limit) if total_items > 0 else 1
+        has_next = page < total_pages
+
+        # Get paginated results (sorted by created_at DESC - newest first)
+        offset = (page - 1) * limit
+        requests = query.order_by(TranscriptionRequest.created_at.desc())\
+            .offset(offset)\
+            .limit(limit)\
+            .all()
+
+        # Format items (same structure as single status endpoint)
+        items = []
+        for request in requests:
+            # Parse results if available
+            transcription_result = None
+            diarization_result = None
+
+            if request.transcription_result:
+                transcription_data = json.loads(request.transcription_result)
+                transcription_result = {
+                    "metadata": {
+                        "request_id": request.request_id,
+                        "created": request.created_at.isoformat() if request.created_at else None,
+                        "duration": request.duration,
+                        "models": [request.transcription_engine] if request.transcription_engine else []
+                    },
+                    "results": {
+                        "channels": [
+                            {
+                                "alternatives": [transcription_data]
+                            }
+                        ]
+                    }
+                }
+
+            if request.diarization_result:
+                diarization_result = json.loads(request.diarization_result)
+
+            items.append({
+                "request_id": request.request_id,
+                "file_hash": request.file_hash,
+                "status": request.status.value,
+                "progress": request.progress,
+                "filename": request.filename,
+                "file_size": request.file_size,
+                "duration": request.duration,
+                "source_language": request.source_language,
+                "output_language": request.output_language,
+                "detected_language": request.detected_language,
+                "detected_language_name": request.detected_language_name,
+                "transcription_engine": request.transcription_engine,
+                "transcription_result": transcription_result,
+                "diarization_result": diarization_result,
+                "error_message": request.error_message,
+                "events": {
+                    "queued_at": request.created_at.isoformat(),
+                    "process_start": request.started_at.isoformat() if request.started_at else None,
+                    "process_end": request.completed_at.isoformat() if request.completed_at else None,
+                    "process_status": request.status.value,
+                }
+            })
+
+        return {
+            "items": items,
+            "page": page,
+            "limit": limit,
+            "total_items": total_items,
+            "total_pages": total_pages,
+            "hasNext": has_next
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting status list: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting status list: {str(e)}")
+
+
 @app.get("/status/{request_id}")
 async def get_status(request_id: str):
-    """Get processing status for a request."""
+    """Get processing status for a single request."""
     try:
         request = db_session.query(TranscriptionRequest)\
             .filter(TranscriptionRequest.request_id == request_id)\
@@ -245,7 +347,24 @@ async def get_status(request_id: str):
         diarization_result = None
 
         if request.transcription_result:
-            transcription_result = json.loads(request.transcription_result)
+            transcription_data = json.loads(request.transcription_result)
+
+            # Restructure transcription result in new nested format
+            transcription_result = {
+                "metadata": {
+                    "request_id": request.request_id,
+                    "created": request.created_at.isoformat() if request.created_at else None,
+                    "duration": request.duration,
+                    "models": [request.transcription_engine] if request.transcription_engine else []
+                },
+                "results": {
+                    "channels": [
+                        {
+                            "alternatives": [transcription_data]
+                        }
+                    ]
+                }
+            }
 
         if request.diarization_result:
             diarization_result = json.loads(request.diarization_result)
@@ -258,24 +377,20 @@ async def get_status(request_id: str):
             "filename": request.filename,
             "file_size": request.file_size,
             "duration": request.duration,
-            "created_at": request.created_at.isoformat(),
-            "started_at": request.started_at.isoformat() if request.started_at else None,
-            "completed_at": request.completed_at.isoformat() if request.completed_at else None,
-            "processing_time": request.processing_time,
-            "accurate_mode": request.accurate_mode,
-            "quantization": request.quantization,
             "source_language": request.source_language,
-            "target_language": request.target_language,
+            "output_language": request.output_language,
             "detected_language": request.detected_language,
             "detected_language_name": request.detected_language_name,
             "transcription_engine": request.transcription_engine,
-            "decoder_type": request.decoder_type,
-            "translation_enabled": request.translation_enabled,
-            "whisper_model": request.whisper_model,
-            "diarization_method": request.diarization_method,
             "transcription_result": transcription_result,
             "diarization_result": diarization_result,
-            "error_message": request.error_message
+            "error_message": request.error_message,
+            "events": {
+                "queued_at": request.created_at.isoformat(),
+                "process_start": request.started_at.isoformat() if request.started_at else None,
+                "process_end": request.completed_at.isoformat() if request.completed_at else None,
+                "process_status": request.status.value,
+            }
         }
 
     except HTTPException:
@@ -337,8 +452,8 @@ async def get_metrics():
                 "estimated_wait_time": f"{queue_status.get('queued', 0) * 3} minutes"
             },
             "configuration": {
-                "whisper_model": config.WHISPER_MODEL,
-                "quantization": config.QUANTIZATION,
+                "model_name": config.MODEL_NAME,
+                "compute_type": config.MODEL_COMPUTE_TYPE,
                 "diarization_gpu": config.DIARIZATION_USE_GPU,
                 "max_concurrent_jobs": config.MAX_CONCURRENT_JOBS
             },
@@ -434,19 +549,26 @@ async def delete_request(request_id: str):
         if not request:
             raise HTTPException(status_code=404, detail="Request not found")
 
-        # Delete file if it exists
-        if Path(request.file_path).exists():
-            Path(request.file_path).unlink()
+        # Safely delete the associated audio file
+        file_deleted = safe_delete_audio_file(
+            file_path=request.file_path,
+            request_id=request_id,
+            context="manual_delete"
+        )
 
-        # Delete database record
+        # Delete database record (even if file deletion failed)
         db_session.delete(request)
         db_session.commit()
 
-        logger.info(f"Deleted request: {request_id}")
+        logger.info(
+            f"Deleted request: {request_id} "
+            f"(file_deleted: {file_deleted})"
+        )
 
         return {
             "message": "Request deleted successfully",
-            "request_id": request_id
+            "request_id": request_id,
+            "file_deleted": file_deleted
         }
 
     except HTTPException:
@@ -468,15 +590,18 @@ async def cancel_request(request_id: str):
             raise HTTPException(status_code=404, detail="Request not found")
 
         # Check if request can be canceled
-        if request.status not in [ProcessingStatus.QUEUED, ProcessingStatus.PROCESSING]:
+        if request.status not in [ProcessingStatus.QUEUED, ProcessingStatus.DIARIZING]:
             raise HTTPException(
                 status_code=400,
-                detail=f"Cannot cancel request with status: {request.status.value}. Only queued or processing requests can be canceled."
+                detail=f"Cannot cancel request with status: {request.status.value}. Only queued or diarizing requests can be canceled."
             )
 
-        # Delete the associated file
-        if Path(request.file_path).exists():
-            Path(request.file_path).unlink()
+        # Safely delete the associated audio file
+        file_deleted = safe_delete_audio_file(
+            file_path=request.file_path,
+            request_id=request_id,
+            context="cancellation"
+        )
 
         # Update status to canceled
         request.status = ProcessingStatus.CANCELED
@@ -484,12 +609,16 @@ async def cancel_request(request_id: str):
         request.error_message = "Request canceled by user"
         db_session.commit()
 
-        logger.info(f"Canceled request: {request_id} (status: {request.status.value})")
+        logger.info(
+            f"Canceled request: {request_id} "
+            f"(status: {request.status.value}, file_deleted: {file_deleted})"
+        )
 
         return {
             "message": "Request canceled successfully",
             "request_id": request_id,
-            "status": "canceled"
+            "status": "canceled",
+            "file_deleted": file_deleted
         }
 
     except HTTPException:
