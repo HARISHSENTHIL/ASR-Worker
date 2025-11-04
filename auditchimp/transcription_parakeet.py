@@ -81,19 +81,25 @@ class ParakeetTranscriber:
         task: str = "transcribe",
         enable_long_form: bool = True,
         local_attention_window: int = 256,
-        progress_callback=None
+        progress_callback=None,
+        vad_segments: Optional[List[Dict]] = None,
+        diarization_segments: Optional[List[Dict]] = None,
+        overlaps: Optional[List[Dict]] = None
     ) -> Dict:
         """
         Transcribe audio using Parakeet model.
-        
+
         Args:
             audio_path: Path to audio file
             language: Source language code (optional)
             task: Either 'transcribe' or 'translate'
             progress_callback: Optional callback function for progress updates
-        
+            vad_segments: Optional VAD segments from diarization
+            diarization_segments: Optional speaker diarization segments
+            overlaps: Optional overlapping speech regions
+
         Returns:
-            Dictionary containing transcription results
+            Dictionary containing transcription results with speaker attribution
         """
         try:
             if not Path(audio_path).exists():
@@ -166,17 +172,265 @@ class ParakeetTranscriber:
                     "text": transcription_text.strip()
                 }]
 
-            return {
-                "text": transcription_text.strip(),
-                "segments": segments,
-                "language": language or "en",
-                "duration": duration,
-                "word_timestamps": word_timestamps  # Include word-level timestamps
-            }
+            # Process word-level timestamps if available
+            word_segments = []
+            if word_timestamps:
+                for word_info in word_timestamps:
+                    if isinstance(word_info, dict):
+                        word_segments.append({
+                            "start": word_info.get("start", 0.0),
+                            "end": word_info.get("end", 0.0),
+                            "text": word_info.get("word", word_info.get("text", "")),
+                            "confidence": word_info.get("confidence", 0.95),
+                            "speaker": None  # Will be assigned if diarization available
+                        })
+
+            # If we have diarization data, map speakers to segments
+            if diarization_segments and word_segments:
+                log_event(logger, "info", "parakeet_speaker_mapping", "Mapping speakers to Parakeet transcription")
+                word_segments = self._map_speakers_word_level(
+                    word_segments,
+                    diarization_segments,
+                    overlaps
+                )
+                # Group words into speaker utterances
+                utterances = self._group_words_into_utterances(word_segments)
+
+                return {
+                    "text": transcription_text.strip(),
+                    "segments": utterances,  # Speaker-attributed utterances
+                    "word_segments": word_segments,  # Word-level detail
+                    "language": language or "en",
+                    "duration": duration,
+                    "word_timestamps": word_timestamps,
+                    "mode": "word_level_with_speakers",
+                    "total_words": len(word_segments),
+                    "total_utterances": len(utterances)
+                }
+            elif diarization_segments and segments:
+                # Fallback: map speakers to segment-level transcription
+                log_event(logger, "info", "parakeet_speaker_mapping_segments", "Mapping speakers to segment-level transcription")
+                segments = self._map_speakers_to_segments(segments, diarization_segments)
+
+                return {
+                    "text": transcription_text.strip(),
+                    "segments": segments,
+                    "language": language or "en",
+                    "duration": duration,
+                    "word_timestamps": word_timestamps,
+                    "mode": "segment_level_with_speakers"
+                }
+            else:
+                # No diarization: return original format
+                return {
+                    "text": transcription_text.strip(),
+                    "segments": segments,
+                    "language": language or "en",
+                    "duration": duration,
+                    "word_timestamps": word_timestamps
+                }
 
         except Exception as e:
             log_event(logger, "error", "parakeet_transcription_failed", "Parakeet transcription error", error=str(e))
             raise
+
+    def _map_speakers_word_level(
+        self,
+        word_segments: List[Dict],
+        diarization_segments: List[Dict],
+        overlaps: Optional[List[Dict]] = None
+    ) -> List[Dict]:
+        """
+        Map speakers to word-level segments with overlap detection.
+
+        Args:
+            word_segments: Word-level transcription segments
+            diarization_segments: Speaker diarization segments
+            overlaps: Overlapping speech regions
+
+        Returns:
+            Word segments with speaker labels and overlap markers
+        """
+        # Create high-resolution time-to-speaker mapping (100ms granularity)
+        speaker_map = {}
+        for dia_seg in diarization_segments:
+            start_ms = int(dia_seg["start"] * 10)  # Convert to 100ms units
+            end_ms = int(dia_seg["end"] * 10)
+            speaker = dia_seg["speaker"]
+
+            for time_100ms in range(start_ms, end_ms + 1):
+                if time_100ms not in speaker_map:
+                    speaker_map[time_100ms] = []
+                speaker_map[time_100ms].append(speaker)
+
+        # Create overlap map for quick lookup
+        overlap_map = {}
+        if overlaps:
+            for overlap in overlaps:
+                start_ms = int(overlap["start"] * 10)
+                end_ms = int(overlap["end"] * 10)
+                for time_100ms in range(start_ms, end_ms + 1):
+                    overlap_map[time_100ms] = overlap["speakers"]
+
+        # Assign speakers to each word
+        for word_seg in word_segments:
+            word_start_ms = int(word_seg["start"] * 10)
+            word_end_ms = int(word_seg["end"] * 10)
+
+            # Collect all speakers during this word's timespan
+            speakers_during_word = []
+            overlap_detected = False
+
+            for time_100ms in range(word_start_ms, word_end_ms + 1):
+                # Check for speakers at this time
+                if time_100ms in speaker_map:
+                    speakers_during_word.extend(speaker_map[time_100ms])
+
+                # Check for overlap at this time
+                if time_100ms in overlap_map:
+                    overlap_detected = True
+
+            if not speakers_during_word:
+                word_seg["speaker"] = "UNKNOWN"
+                word_seg["overlap"] = False
+                continue
+
+            # Count speaker occurrences
+            speaker_count = {}
+            for spk in speakers_during_word:
+                speaker_count[spk] = speaker_count.get(spk, 0) + 1
+
+            # Get dominant speaker
+            dominant_speaker = max(speaker_count, key=speaker_count.get)
+
+            # Check if there are multiple speakers (overlap)
+            unique_speakers = list(set(speakers_during_word))
+            if len(unique_speakers) > 1 or overlap_detected:
+                word_seg["speaker"] = dominant_speaker
+                word_seg["overlap"] = True
+                word_seg["all_speakers"] = sorted(unique_speakers)
+            else:
+                word_seg["speaker"] = dominant_speaker
+                word_seg["overlap"] = False
+
+        return word_segments
+
+    def _group_words_into_utterances(self, word_segments: List[Dict]) -> List[Dict]:
+        """
+        Group words into speaker utterances for better readability.
+
+        Combines consecutive words from the same speaker into utterances,
+        preserving overlap information.
+
+        Args:
+            word_segments: Word-level segments with speaker labels
+
+        Returns:
+            List of utterances (grouped words by speaker)
+        """
+        if not word_segments:
+            return []
+
+        utterances = []
+        current_utterance = {
+            "speaker": word_segments[0].get("speaker"),
+            "words": [word_segments[0]],
+            "start": word_segments[0]["start"],
+            "end": word_segments[0]["end"],
+            "has_overlap": word_segments[0].get("overlap", False)
+        }
+
+        for word_seg in word_segments[1:]:
+            current_speaker = word_seg.get("speaker")
+            prev_speaker = current_utterance["speaker"]
+
+            # Check if we should continue current utterance or start new one
+            # Continue if: same speaker AND time gap < 1.0 second
+            time_gap = word_seg["start"] - current_utterance["end"]
+
+            if current_speaker == prev_speaker and time_gap < 1.0:
+                # Continue current utterance
+                current_utterance["words"].append(word_seg)
+                current_utterance["end"] = word_seg["end"]
+                if word_seg.get("overlap", False):
+                    current_utterance["has_overlap"] = True
+            else:
+                # Finalize current utterance
+                current_utterance["text"] = ' '.join([w["text"] for w in current_utterance["words"]])
+                current_utterance["word_count"] = len(current_utterance["words"])
+
+                # Calculate confidence (average)
+                avg_confidence = sum(w.get("confidence", 0.95) for w in current_utterance["words"]) / len(current_utterance["words"])
+                current_utterance["confidence"] = round(avg_confidence, 3)
+
+                utterances.append(current_utterance)
+
+                # Start new utterance
+                current_utterance = {
+                    "speaker": current_speaker,
+                    "words": [word_seg],
+                    "start": word_seg["start"],
+                    "end": word_seg["end"],
+                    "has_overlap": word_seg.get("overlap", False)
+                }
+
+        # Add the last utterance
+        current_utterance["text"] = ' '.join([w["text"] for w in current_utterance["words"]])
+        current_utterance["word_count"] = len(current_utterance["words"])
+        avg_confidence = sum(w.get("confidence", 0.95) for w in current_utterance["words"]) / len(current_utterance["words"])
+        current_utterance["confidence"] = round(avg_confidence, 3)
+        utterances.append(current_utterance)
+
+        logger.info(f"Grouped {len(word_segments)} words into {len(utterances)} utterances")
+        return utterances
+
+    def _map_speakers_to_segments(
+        self,
+        transcription_segments: List[Dict],
+        diarization_segments: List[Dict]
+    ) -> List[Dict]:
+        """
+        Map speaker labels from diarization to transcription segments.
+
+        For each transcription segment, finds the dominant speaker based on
+        time overlap with diarization segments.
+
+        Args:
+            transcription_segments: Segments from transcription with timing
+            diarization_segments: Segments from diarization with speaker labels
+
+        Returns:
+            Transcription segments with speaker labels added
+        """
+        # Create a time-to-speaker mapping (second-level granularity)
+        speaker_map = {}
+        for dia_seg in diarization_segments:
+            start = int(dia_seg["start"])
+            end = int(dia_seg["end"])
+            speaker = dia_seg["speaker"]
+
+            for second in range(start, end + 1):
+                speaker_map[second] = speaker
+
+        # Assign speakers to transcription segments
+        for trans_seg in transcription_segments:
+            seg_start = int(trans_seg["start"])
+            seg_end = int(trans_seg["end"])
+
+            # Count occurrences of each speaker in this segment
+            speaker_count = {}
+            for second in range(seg_start, seg_end + 1):
+                if speaker := speaker_map.get(second):
+                    speaker_count[speaker] = speaker_count.get(speaker, 0) + 1
+
+            # Assign the dominant speaker
+            if speaker_count:
+                dominant_speaker = max(speaker_count, key=speaker_count.get)
+                trans_seg["speaker"] = dominant_speaker
+            else:
+                trans_seg["speaker"] = "UNKNOWN"
+
+        return transcription_segments
 
     def __del__(self):
         """Cleanup when object is destroyed."""

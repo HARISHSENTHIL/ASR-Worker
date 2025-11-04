@@ -190,7 +190,10 @@ class TranscriptionEngineManager:
                 result = await self.parakeet_engine.transcribe(
                     audio_path=audio_path,
                     language=source_lang,
-                    task="transcribe"
+                    task="transcribe",
+                    vad_segments=vad_segments,
+                    diarization_segments=diarization_segments,
+                    overlaps=overlaps
                 )
 
                 # Add engine metadata
