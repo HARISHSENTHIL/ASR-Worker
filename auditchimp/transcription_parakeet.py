@@ -74,6 +74,175 @@ class ParakeetTranscriber:
             log_event(logger, "error", "parakeet_init_failed", "Error loading Parakeet model", error=str(e))
             raise
 
+    async def transcribe_with_vad_chunking(
+        self,
+        audio_path: str,
+        language: Optional[str] = None,
+        vad_segments: Optional[List[Dict]] = None,
+        diarization_segments: Optional[List[Dict]] = None,
+        overlaps: Optional[List[Dict]] = None,
+        progress_callback=None
+    ) -> Dict:
+        """
+        Transcribe audio using VAD segments for precise chunking (like IndicConformer).
+
+        Args:
+            audio_path: Path to audio file
+            language: Source language code (optional)
+            vad_segments: VAD segments from NeMo (speech boundaries)
+            diarization_segments: Optional speaker diarization segments
+            overlaps: Optional overlapping speech regions
+            progress_callback: Optional callback function for progress updates
+
+        Returns:
+            Dictionary containing word-level transcription with speaker attribution
+        """
+        try:
+            import torchaudio
+
+            log_event(
+                logger, "info", "parakeet_vad_transcription_started",
+                "Starting VAD-based Parakeet transcription",
+                language=language,
+                vad_segments=len(vad_segments) if vad_segments else 0
+            )
+
+            if not self.model:
+                raise RuntimeError("Model not initialized. Call initialize() first.")
+
+            # Load and preprocess audio
+            wav, sr = torchaudio.load(audio_path)
+
+            # Convert to mono if stereo
+            if wav.shape[0] > 1:
+                logger.info("Converting stereo to mono...")
+                import torch
+                wav = torch.mean(wav, dim=0, keepdim=True)
+
+            # Resample to 16kHz if needed
+            if sr != 16000:
+                logger.info(f"Resampling from {sr}Hz to 16000Hz...")
+                resampler = torchaudio.transforms.Resample(sr, 16000)
+                wav = resampler(wav)
+                sr = 16000
+
+            total_duration = wav.shape[1] / sr
+
+            # Process each VAD segment (speech-only chunks)
+            all_word_segments = []
+            segment_num = 0
+
+            if not vad_segments:
+                # Fallback: process entire audio as one segment
+                vad_segments = [{"start": 0.0, "end": total_duration, "type": "speech"}]
+
+            for vad_seg in vad_segments:
+                start_time = vad_seg["start"]
+                end_time = vad_seg["end"]
+                segment_num += 1
+
+                # Extract audio chunk based on VAD boundaries
+                start_sample = int(start_time * sr)
+                end_sample = int(end_time * sr)
+                chunk = wav[:, start_sample:end_sample]
+
+                # Skip very short chunks (< 0.5s)
+                chunk_duration = (end_sample - start_sample) / sr
+                if chunk_duration < 0.5:
+                    continue
+
+                try:
+                    # Save chunk to temporary file for NeMo processing
+                    import tempfile
+                    import os
+
+                    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                        temp_path = temp_file.name
+                        torchaudio.save(temp_path, chunk, sr)
+
+                    # Transcribe VAD segment using NeMo
+                    transcriptions = self.model.transcribe(
+                        audio=[temp_path],
+                        batch_size=1,
+                        return_hypotheses=True
+                    )
+
+                    # Clean up temp file
+                    os.unlink(temp_path)
+
+                    # Extract hypothesis
+                    if isinstance(transcriptions, tuple):
+                        hypothesis = transcriptions[0][0]
+                    else:
+                        hypothesis = transcriptions[0]
+
+                    text = hypothesis.text if hasattr(hypothesis, 'text') else str(hypothesis)
+
+                    if not text.strip():
+                        continue
+
+                    # Split into words and create word-level segments
+                    words = text.strip().split()
+                    if not words:
+                        continue
+
+                    # Estimate word timing (proportional distribution)
+                    word_duration = chunk_duration / len(words)
+
+                    for word_idx, word in enumerate(words):
+                        word_start = start_time + (word_idx * word_duration)
+                        word_end = start_time + ((word_idx + 1) * word_duration)
+
+                        all_word_segments.append({
+                            "start": round(word_start, 3),
+                            "end": round(word_end, 3),
+                            "text": word,
+                            "confidence": 0.95,
+                            "vad_segment": segment_num,
+                            "speaker": None  # Will be assigned later
+                        })
+
+                except Exception as e:
+                    log_event(logger, "warning", "vad_segment_error", "Error transcribing VAD segment", segment=segment_num, error=str(e))
+                    continue
+
+            log_event(
+                logger, "success", "parakeet_vad_transcription_completed",
+                "VAD-based transcription completed",
+                total_words=len(all_word_segments),
+                vad_segments_processed=segment_num
+            )
+
+            # Map speakers to word-level segments
+            if diarization_segments:
+                all_word_segments = self._map_speakers_word_level(
+                    all_word_segments,
+                    diarization_segments,
+                    overlaps
+                )
+
+            # Combine words into utterances for better readability
+            utterances = self._group_words_into_utterances(all_word_segments)
+
+            # Calculate full text
+            full_text = ' '.join([word["text"] for word in all_word_segments])
+
+            return {
+                "text": full_text,
+                "segments": utterances,           # Grouped utterances
+                "word_segments": all_word_segments,  # Word-level detail
+                "mode": "vad_chunked_word_level",
+                "total_words": len(all_word_segments),
+                "total_utterances": len(utterances),
+                "language": language or "en",
+                "duration": total_duration,
+                "vad_segments_processed": segment_num
+            }
+
+        except Exception as e:
+            log_event(logger, "error", "parakeet_vad_transcription_failed", "VAD-based transcription failed", error=str(e))
+            raise
+
     async def transcribe(
         self,
         audio_path: str,
@@ -101,6 +270,16 @@ class ParakeetTranscriber:
         Returns:
             Dictionary containing transcription results with speaker attribution
         """
+        # If VAD segments are provided, use VAD-based chunking
+        if vad_segments and diarization_segments:
+            return await self.transcribe_with_vad_chunking(
+                audio_path=audio_path,
+                language=language,
+                vad_segments=vad_segments,
+                diarization_segments=diarization_segments,
+                overlaps=overlaps,
+                progress_callback=progress_callback
+            )
         try:
             if not Path(audio_path).exists():
                 raise FileNotFoundError(f"Audio file not found: {audio_path}")
