@@ -256,162 +256,32 @@ class ParakeetTranscriber:
         overlaps: Optional[List[Dict]] = None
     ) -> Dict:
         """
-        Transcribe audio using Parakeet model.
+        Transcribe audio using Parakeet model with VAD-based chunking.
+
+        This method now uses the same VAD-based approach as IndicConformer
+        for accurate speaker attribution.
 
         Args:
             audio_path: Path to audio file
             language: Source language code (optional)
             task: Either 'transcribe' or 'translate'
             progress_callback: Optional callback function for progress updates
-            vad_segments: Optional VAD segments from diarization
-            diarization_segments: Optional speaker diarization segments
+            vad_segments: VAD segments from diarization (required for speaker attribution)
+            diarization_segments: Speaker diarization segments (required for speaker attribution)
             overlaps: Optional overlapping speech regions
 
         Returns:
             Dictionary containing transcription results with speaker attribution
         """
-        # If VAD segments are provided, use VAD-based chunking
-        if vad_segments and diarization_segments:
-            return await self.transcribe_with_vad_chunking(
-                audio_path=audio_path,
-                language=language,
-                vad_segments=vad_segments,
-                diarization_segments=diarization_segments,
-                overlaps=overlaps,
-                progress_callback=progress_callback
-            )
-        try:
-            if not Path(audio_path).exists():
-                raise FileNotFoundError(f"Audio file not found: {audio_path}")
-
-            if not self.model:
-                raise RuntimeError("Model not initialized. Call initialize() first.")
-
-            # NeMo handles stereo→mono conversion internally via channel_selector
-            # No need for manual conversion - NeMo averages channels automatically
-            log_event(
-                logger, "info", "parakeet_transcription_starting",
-                "Starting Parakeet transcription with automatic channel handling",
-                audio_path=audio_path
-            )
-
-            # Transcribe with timestamps using correct NeMo API
-            # channel_selector='average' handles stereo audio by averaging L+R channels
-            transcriptions = self.model.transcribe(
-                audio=[audio_path],
-                batch_size=self.batch_size,
-                channel_selector='average',  # Automatically convert stereo to mono
-                return_hypotheses=True  # Return hypothesis objects for timestamp access
-            )
-
-            # Handle return format - can be tuple or list
-            if isinstance(transcriptions, tuple):
-                # Format: (best_hypotheses, all_hypotheses)
-                hypothesis = transcriptions[0][0]  # First file, best hypothesis
-            else:
-                # Direct list of hypotheses
-                hypothesis = transcriptions[0]
-
-            # Extract text
-            transcription_text = hypothesis.text if hasattr(hypothesis, 'text') else str(hypothesis)
-
-            # Extract timestamps if available
-            word_timestamps = []
-            segment_timestamps = []
-            duration = 0.0
-
-            if hasattr(hypothesis, 'timestep'):
-                # Word-level timestamps from hypothesis
-                word_timestamps = hypothesis.timestep.get('word', []) if hasattr(hypothesis.timestep, 'get') else []
-                segment_timestamps = hypothesis.timestep.get('segment', []) if hasattr(hypothesis.timestep, 'get') else []
-
-            # Estimate duration from audio file if not in hypothesis
-            if not duration:
-                duration = librosa.get_duration(filename=audio_path)
-
-            # Format segments with timestamps
-            segments = []
-            if segment_timestamps:
-                for segment in segment_timestamps:
-                    segments.append({
-                        "start": segment.get("start", 0.0),
-                        "end": segment.get("end", 0.0),
-                        "text": segment.get("segment", segment.get("text", "")).strip()
-                    })
-
-                    # Update progress if callback provided
-                    if progress_callback and duration > 0:
-                        progress = (segment.get("end", 0.0) / duration) * 100
-                        progress_callback(progress)
-            else:
-                # Fallback: create single segment if no timestamps available
-                segments = [{
-                    "start": 0.0,
-                    "end": duration,
-                    "text": transcription_text.strip()
-                }]
-
-            # Process word-level timestamps if available
-            word_segments = []
-            if word_timestamps:
-                for word_info in word_timestamps:
-                    if isinstance(word_info, dict):
-                        word_segments.append({
-                            "start": word_info.get("start", 0.0),
-                            "end": word_info.get("end", 0.0),
-                            "text": word_info.get("word", word_info.get("text", "")),
-                            "confidence": word_info.get("confidence", 0.95),
-                            "speaker": None  # Will be assigned if diarization available
-                        })
-
-            # If we have diarization data, map speakers to segments
-            if diarization_segments and word_segments:
-                log_event(logger, "info", "parakeet_speaker_mapping", "Mapping speakers to Parakeet transcription")
-                word_segments = self._map_speakers_word_level(
-                    word_segments,
-                    diarization_segments,
-                    overlaps
-                )
-                # Group words into speaker utterances
-                utterances = self._group_words_into_utterances(word_segments)
-
-                return {
-                    "text": transcription_text.strip(),
-                    "segments": utterances,  # Speaker-attributed utterances
-                    "word_segments": word_segments,  # Word-level detail
-                    "language": language or "en",
-                    "duration": duration,
-                    "word_timestamps": word_timestamps,
-                    "mode": "word_level_with_speakers",
-                    "total_words": len(word_segments),
-                    "total_utterances": len(utterances)
-                }
-            elif diarization_segments and segments:
-                # Fallback: map speakers to segment-level transcription
-                log_event(logger, "info", "parakeet_speaker_mapping_segments", "Mapping speakers to segment-level transcription")
-                segments = self._map_speakers_to_segments(segments, diarization_segments)
-
-                return {
-                    "text": transcription_text.strip(),
-                    "segments": segments,
-                    "language": language or "en",
-                    "duration": duration,
-                    "word_timestamps": word_timestamps,
-                    "mode": "segment_level_with_speakers"
-                }
-            else:
-                # No diarization: return original format
-                return {
-                    "text": transcription_text.strip(),
-                    "segments": segments,
-                    "language": language or "en",
-                    "duration": duration,
-                    "word_timestamps": word_timestamps
-                }
-
-        except Exception as e:
-            log_event(logger, "error", "parakeet_transcription_failed", "Parakeet transcription error", error=str(e))
-            raise
+        # Always use VAD-based chunking (same approach as Indic)
+        return await self.transcribe_with_vad_chunking(
+            audio_path=audio_path,
+            language=language,
+            vad_segments=vad_segments,
+            diarization_segments=diarization_segments,
+            overlaps=overlaps,
+            progress_callback=progress_callback
+        )
 
     def _map_speakers_word_level(
         self,
@@ -562,54 +432,6 @@ class ParakeetTranscriber:
 
         logger.info(f"Grouped {len(word_segments)} words into {len(utterances)} utterances")
         return utterances
-
-    def _map_speakers_to_segments(
-        self,
-        transcription_segments: List[Dict],
-        diarization_segments: List[Dict]
-    ) -> List[Dict]:
-        """
-        Map speaker labels from diarization to transcription segments.
-
-        For each transcription segment, finds the dominant speaker based on
-        time overlap with diarization segments.
-
-        Args:
-            transcription_segments: Segments from transcription with timing
-            diarization_segments: Segments from diarization with speaker labels
-
-        Returns:
-            Transcription segments with speaker labels added
-        """
-        # Create a time-to-speaker mapping (second-level granularity)
-        speaker_map = {}
-        for dia_seg in diarization_segments:
-            start = int(dia_seg["start"])
-            end = int(dia_seg["end"])
-            speaker = dia_seg["speaker"]
-
-            for second in range(start, end + 1):
-                speaker_map[second] = speaker
-
-        # Assign speakers to transcription segments
-        for trans_seg in transcription_segments:
-            seg_start = int(trans_seg["start"])
-            seg_end = int(trans_seg["end"])
-
-            # Count occurrences of each speaker in this segment
-            speaker_count = {}
-            for second in range(seg_start, seg_end + 1):
-                if speaker := speaker_map.get(second):
-                    speaker_count[speaker] = speaker_count.get(speaker, 0) + 1
-
-            # Assign the dominant speaker
-            if speaker_count:
-                dominant_speaker = max(speaker_count, key=speaker_count.get)
-                trans_seg["speaker"] = dominant_speaker
-            else:
-                trans_seg["speaker"] = "UNKNOWN"
-
-        return transcription_segments
 
     def __del__(self):
         """Cleanup when object is destroyed."""
