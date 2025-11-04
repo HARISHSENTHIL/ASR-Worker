@@ -100,12 +100,10 @@ class ParakeetTranscriber:
         try:
             import torchaudio
 
-            log_event(
-                logger, "info", "parakeet_vad_transcription_started",
-                "Starting VAD-based Parakeet transcription",
-                language=language,
-                vad_segments=len(vad_segments) if vad_segments else 0
-            )
+            logger.info("=" * 80)
+            logger.info(f"PARAKEET: Starting VAD-based transcription")
+            logger.info(f"PARAKEET: Language: {language or 'auto'}, VAD segments: {len(vad_segments) if vad_segments else 0}")
+            logger.info("=" * 80)
 
             if not self.model:
                 raise RuntimeError("Model not initialized. Call initialize() first.")
@@ -115,18 +113,19 @@ class ParakeetTranscriber:
 
             # Convert to mono if stereo
             if wav.shape[0] > 1:
-                logger.info("Converting stereo to mono...")
+                logger.info("PARAKEET: Converting stereo to mono")
                 import torch
                 wav = torch.mean(wav, dim=0, keepdim=True)
 
             # Resample to 16kHz if needed
             if sr != 16000:
-                logger.info(f"Resampling from {sr}Hz to 16000Hz...")
+                logger.info(f"PARAKEET: Resampling from {sr}Hz to 16000Hz")
                 resampler = torchaudio.transforms.Resample(sr, 16000)
                 wav = resampler(wav)
                 sr = 16000
 
             total_duration = wav.shape[1] / sr
+            logger.info(f"PARAKEET: Audio prepared - Duration: {total_duration:.2f}s, Sample rate: 16kHz")
 
             # Process each VAD segment (speech-only chunks)
             all_word_segments = []
@@ -135,6 +134,8 @@ class ParakeetTranscriber:
             if not vad_segments:
                 # Fallback: process entire audio as one segment
                 vad_segments = [{"start": 0.0, "end": total_duration, "type": "speech"}]
+
+            logger.info(f"PARAKEET: Processing {len(vad_segments)} VAD segments")
 
             for vad_seg in vad_segments:
                 start_time = vad_seg["start"]
@@ -150,6 +151,8 @@ class ParakeetTranscriber:
                 chunk_duration = (end_sample - start_sample) / sr
                 if chunk_duration < 0.5:
                     continue
+
+                logger.info(f"PARAKEET: Transcribing segment {segment_num}/{len(vad_segments)} ({start_time:.2f}s - {end_time:.2f}s, duration: {chunk_duration:.2f}s)")
 
                 try:
                     # Save chunk to temporary file for NeMo processing
@@ -206,26 +209,28 @@ class ParakeetTranscriber:
                     log_event(logger, "warning", "vad_segment_error", "Error transcribing VAD segment", segment=segment_num, error=str(e))
                     continue
 
-            log_event(
-                logger, "success", "parakeet_vad_transcription_completed",
-                "VAD-based transcription completed",
-                total_words=len(all_word_segments),
-                vad_segments_processed=segment_num
-            )
+            logger.info(f"PARAKEET: Transcription completed - {len(all_word_segments)} words from {segment_num} VAD segments")
 
             # Map speakers to word-level segments
             if diarization_segments:
+                logger.info("PARAKEET: Mapping speakers to word-level segments")
                 all_word_segments = self._map_speakers_word_level(
                     all_word_segments,
                     diarization_segments,
                     overlaps
                 )
+                logger.info(f"PARAKEET: Speaker mapping completed")
 
             # Combine words into utterances for better readability
+            logger.info("PARAKEET: Grouping words into speaker utterances")
             utterances = self._group_words_into_utterances(all_word_segments)
 
             # Calculate full text
             full_text = ' '.join([word["text"] for word in all_word_segments])
+
+            logger.info("=" * 80)
+            logger.info(f"PARAKEET: Complete - {len(utterances)} utterances, {len(all_word_segments)} words")
+            logger.info("=" * 80)
 
             return {
                 "text": full_text,

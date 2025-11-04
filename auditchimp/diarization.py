@@ -103,6 +103,7 @@ class DiarizationEngine:
                         'max_rp_threshold': 0.15,  # LOWERED: Be more conservative about merging speakers
                         'sparse_search_volume': 30,
                         'maj_vote_spk_count': True,  # ENABLED: Use majority voting for robust speaker counting
+                        'cuda': self.config.DIARIZATION_USE_GPU and torch.cuda.is_available(),  # Enable GPU for clustering
                     }
                 },
             }
@@ -221,7 +222,12 @@ class DiarizationEngine:
             import shutil
             import uuid
 
+            logger.info("=" * 80)
+            logger.info("DIARIZATION: Starting speaker diarization pipeline")
+            logger.info("=" * 80)
+
             # Load audio and convert to mono 16kHz
+            logger.info(f"DIARIZATION: Loading audio file: {Path(audio_path).name}")
             audio, sr = librosa.load(audio_path, sr=16000, mono=True)
 
             # Create unique output directory for this diarization run to avoid conflicts
@@ -235,12 +241,8 @@ class DiarizationEngine:
 
             # Get audio duration
             duration = librosa.get_duration(y=audio, sr=16000)
-            log_event(
-                logger, "info", "audio_preprocessing_completed", "Audio preprocessed for diarization",
-                duration_sec=round(duration, 2),
-                sample_rate=16000,
-                channels=1
-            )
+            logger.info(f"DIARIZATION: Audio duration: {duration:.2f}s, Sample rate: 16kHz, Channels: Mono")
+            logger.info(f"DIARIZATION: Processing device: {self.device.upper()}")
 
             # Clean up NeMo output directories if they exist (prevents "File exists" errors)
             nemo_dirs = ['speaker_outputs', 'pred_rttms']
@@ -279,9 +281,22 @@ class DiarizationEngine:
             self.msdd_model._cfg.diarizer.out_dir = str(output_dir)
 
             # Run diarization
-            log_event(logger, "info", "nemo_diarization_started", "NeMo diarization execution started")
+            logger.info("DIARIZATION: Step 1/3 - Running Voice Activity Detection (VAD)")
+            logger.info("DIARIZATION: Step 2/3 - Extracting speaker embeddings")
+            logger.info("DIARIZATION: Step 3/3 - Clustering speakers")
+
+            # Suppress NeMo's verbose logging temporarily
+            import logging as std_logging
+            nemo_logger = std_logging.getLogger('nemo_logger')
+            original_level = nemo_logger.level
+            nemo_logger.setLevel(std_logging.WARNING)
+
             self.msdd_model.diarize()
-            log_event(logger, "info", "nemo_diarization_processing", "NeMo diarization completed, reading results")
+
+            # Restore logging level
+            nemo_logger.setLevel(original_level)
+
+            logger.info("DIARIZATION: Pipeline completed, processing results")
 
             # NeMo saves RTTM output to pred_rttms subdirectory
             # The filename uses the base name from the audio file in the manifest
@@ -325,12 +340,8 @@ class DiarizationEngine:
                                 "speaker": speaker
                             })
 
-                log_event(
-                    logger, "info", "speakers_detected", "Speaker detection from RTTM completed",
-                    num_speakers=len(unique_speakers),
-                    segments=len(segments),
-                    speakers=list(unique_speakers)
-                )
+                logger.info(f"DIARIZATION: Detected {len(unique_speakers)} speakers in {len(segments)} segments")
+                logger.info(f"DIARIZATION: Speaker labels: {', '.join(sorted(unique_speakers))}")
             else:
                 search_path = str(pred_rttms_dir) if pred_rttms_dir.exists() else str(output_dir)
                 log_event(logger, "warning", "rttm_not_found", "RTTM file not found", search_path=search_path)
@@ -347,11 +358,20 @@ class DiarizationEngine:
 
             # Extract VAD segments from diarization results
             vad_segments = self._extract_vad_segments_from_diarization(segments)
+            logger.info(f"DIARIZATION: Extracted {len(vad_segments)} VAD segments from diarization")
 
             # Detect overlapping speech
             overlaps = self._detect_overlapping_speech(segments)
+            if overlaps:
+                logger.info(f"DIARIZATION: Detected {len(overlaps)} overlapping speech regions")
+            else:
+                logger.info("DIARIZATION: No overlapping speech detected")
 
             num_speakers = len(set(s['speaker'] for s in segments))
+
+            logger.info("=" * 80)
+            logger.info(f"DIARIZATION: Complete - {num_speakers} speakers, {len(segments)} segments, {len(vad_segments)} VAD segments")
+            logger.info("=" * 80)
 
             result = {
                 "segments": segments,

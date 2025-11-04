@@ -140,12 +140,10 @@ class IndicConformerEngine:
             Dictionary containing word-level segments with speaker labels
         """
         try:
-            log_event(
-                logger, "info", "indic_vad_transcription_started",
-                "Starting VAD-based IndicConformer transcription",
-                language=language,
-                vad_segments=len(vad_segments)
-            )
+            logger.info("=" * 80)
+            logger.info(f"INDIC: Starting VAD-based transcription")
+            logger.info(f"INDIC: Language: {self.language_names.get(language, language)}, VAD segments: {len(vad_segments)}")
+            logger.info("=" * 80)
 
             # Validate language
             if not self.is_language_supported(language):
@@ -159,21 +157,24 @@ class IndicConformerEngine:
 
             # Convert to mono if stereo
             if wav.shape[0] > 1:
-                logger.info("Converting stereo to mono...")
+                logger.info("INDIC: Converting stereo to mono")
                 wav = torch.mean(wav, dim=0, keepdim=True)
 
             # Resample to 16kHz if needed
             if sr != 16000:
-                logger.info(f"Resampling from {sr}Hz to 16000Hz...")
+                logger.info(f"INDIC: Resampling from {sr}Hz to 16000Hz")
                 resampler = torchaudio.transforms.Resample(sr, 16000)
                 wav = resampler(wav)
                 sr = 16000
 
             total_duration = wav.shape[1] / sr
+            logger.info(f"INDIC: Audio prepared - Duration: {total_duration:.2f}s, Sample rate: 16kHz")
 
             # Process each VAD segment (speech-only chunks)
             all_word_segments = []
             segment_num = 0
+
+            logger.info(f"INDIC: Processing {len(vad_segments)} VAD segments")
 
             for vad_seg in vad_segments:
                 start_time = vad_seg["start"]
@@ -189,6 +190,8 @@ class IndicConformerEngine:
                 chunk_duration = (end_sample - start_sample) / sr
                 if chunk_duration < 0.5:
                     continue
+
+                logger.info(f"INDIC: Transcribing segment {segment_num}/{len(vad_segments)} ({start_time:.2f}s - {end_time:.2f}s, duration: {chunk_duration:.2f}s)")
 
                 try:
                     # Move chunk to same device as model for GPU acceleration
@@ -226,26 +229,28 @@ class IndicConformerEngine:
                     log_event(logger, "warning", "vad_segment_error", "Error transcribing VAD segment", segment=segment_num, error=str(e))
                     continue
 
-            log_event(
-                logger, "success", "indic_vad_transcription_completed",
-                "VAD-based transcription completed",
-                total_words=len(all_word_segments),
-                vad_segments_processed=segment_num
-            )
+            logger.info(f"INDIC: Transcription completed - {len(all_word_segments)} words from {segment_num} VAD segments")
 
             # Map speakers to word-level segments
             if diarization_segments:
+                logger.info("INDIC: Mapping speakers to word-level segments")
                 all_word_segments = self._map_speakers_word_level(
                     all_word_segments,
                     diarization_segments,
                     overlaps
                 )
+                logger.info(f"INDIC: Speaker mapping completed")
 
             # Combine words into utterances for better readability
+            logger.info("INDIC: Grouping words into speaker utterances")
             utterances = self._group_words_into_utterances(all_word_segments)
 
             # Calculate full text
             full_text = ' '.join([word["text"] for word in all_word_segments])
+
+            logger.info("=" * 80)
+            logger.info(f"INDIC: Complete - {len(utterances)} utterances, {len(all_word_segments)} words")
+            logger.info("=" * 80)
 
             return {
                 "segments": utterances,           # Grouped utterances
