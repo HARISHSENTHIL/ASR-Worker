@@ -20,10 +20,33 @@ class DiarizationEngine:
         self.msdd_model = None
         self.device = "cuda" if torch.cuda.is_available() and config.DIARIZATION_USE_GPU else "cpu"
 
+        # Log device selection with detailed GPU info
+        gpu_available = torch.cuda.is_available()
+        gpu_enabled = config.DIARIZATION_USE_GPU
+        logger.info("=" * 80)
+        logger.info("DIARIZATION INITIALIZATION")
+        logger.info("=" * 80)
+        logger.info(f"DIARIZATION: PyTorch CUDA available: {gpu_available}")
+        if gpu_available:
+            logger.info(f"DIARIZATION: CUDA device count: {torch.cuda.device_count()}")
+            logger.info(f"DIARIZATION: CUDA device name: {torch.cuda.get_device_name(0)}")
+        logger.info(f"DIARIZATION: Config DIARIZATION_USE_GPU: {gpu_enabled}")
+        logger.info(f"DIARIZATION: Selected device: {self.device.upper()}")
+        logger.info("=" * 80)
+
     async def initialize(self):
         """Initialize NeMo diarization models."""
         try:
             log_event(logger, "info", "diarization_init_started", "Initializing NeMo diarization pipeline", device=self.device)
+
+            # Suppress NeMo's verbose logging
+            import logging as std_logging
+            nemo_logger = std_logging.getLogger('nemo_logger')
+            nemo_logger.setLevel(std_logging.ERROR)
+
+            # Suppress specific NeMo warning loggers
+            std_logging.getLogger('NeMo').setLevel(std_logging.ERROR)
+            std_logging.getLogger('nemo.collections.asr').setLevel(std_logging.ERROR)
 
             # Import NeMo dependencies
             from nemo.collections.asr.models import ClusteringDiarizer
@@ -103,13 +126,19 @@ class DiarizationEngine:
                         'max_rp_threshold': 0.15,  # LOWERED: Be more conservative about merging speakers
                         'sparse_search_volume': 30,
                         'maj_vote_spk_count': True,  # ENABLED: Use majority voting for robust speaker counting
-                        'cuda': self.config.DIARIZATION_USE_GPU and torch.cuda.is_available(),  # Enable GPU for clustering
+                        'cuda': True if self.device == "cuda" else False,  # Enable GPU for clustering based on device
                     }
                 },
             }
         }
 
-        return OmegaConf.create(config)
+        cfg = OmegaConf.create(config)
+
+        # Log clustering CUDA setting
+        cuda_enabled = cfg.diarizer.clustering.parameters.cuda
+        logger.info(f"DIARIZATION CONFIG: Clustering CUDA parameter set to: {cuda_enabled}")
+
+        return cfg
 
     def _extract_vad_segments_from_diarization(self, diarization_segments: List[Dict]) -> List[Dict]:
         """
@@ -285,16 +314,29 @@ class DiarizationEngine:
             logger.info("DIARIZATION: Step 2/3 - Extracting speaker embeddings")
             logger.info("DIARIZATION: Step 3/3 - Clustering speakers")
 
-            # Suppress NeMo's verbose logging temporarily
+            # Suppress ALL NeMo logging during diarization
             import logging as std_logging
-            nemo_logger = std_logging.getLogger('nemo_logger')
-            original_level = nemo_logger.level
-            nemo_logger.setLevel(std_logging.WARNING)
+
+            # Save all current log levels
+            loggers_to_suppress = [
+                'nemo_logger',
+                'NeMo',
+                'nemo.collections.asr',
+                'nemo.collections.asr.parts.utils.speaker_utils',
+                'nemo.collections.asr.models',
+            ]
+
+            original_levels = {}
+            for logger_name in loggers_to_suppress:
+                log = std_logging.getLogger(logger_name)
+                original_levels[logger_name] = log.level
+                log.setLevel(std_logging.CRITICAL)  # Only show critical errors
 
             self.msdd_model.diarize()
 
-            # Restore logging level
-            nemo_logger.setLevel(original_level)
+            # Restore all logging levels
+            for logger_name, level in original_levels.items():
+                std_logging.getLogger(logger_name).setLevel(level)
 
             logger.info("DIARIZATION: Pipeline completed, processing results")
 
