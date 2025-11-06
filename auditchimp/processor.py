@@ -32,6 +32,7 @@ class JobProcessor:
         self.processing_requests = set()
         self.executor = ThreadPoolExecutor(max_workers=config.MAX_CONCURRENT_JOBS, thread_name_prefix="JobProcessor")
         self._lock = threading.Lock()
+        self._job_available_event = threading.Event()  # Event to wake up processor when jobs complete
 
     async def initialize(self):
         """Initialize processing engines."""
@@ -81,7 +82,11 @@ class JobProcessor:
 
                 # Then process new jobs
                 self._process_jobs()
-                time.sleep(2)
+
+                # Wait for either timeout (0.5s) or job completion event
+                # This ensures immediate pickup when a job completes
+                self._job_available_event.wait(timeout=0.5)
+                self._job_available_event.clear()  # Reset event for next iteration
 
             except Exception as e:
                 log_event(logger, "error", "processing_loop_error", "Job processing loop error", error=str(e))
@@ -411,8 +416,13 @@ class JobProcessor:
             # Get result or exception
             result = future.result()
 
+            # Signal that a job slot is now available - wake up processor immediately
+            self._job_available_event.set()
+
         except Exception as e:
             logger.error(f"Job failed for request {request_id}: {e}")
+            # Still signal job completion even on failure
+            self._job_available_event.set()
 
     def _update_progress_sync(self, request: TranscriptionRequest, progress: float, status: str = None):
         """Update progress from sync context."""

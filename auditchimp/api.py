@@ -196,6 +196,10 @@ async def submit_audio(
         db_session.add(request_obj)
         db_session.commit()
 
+        # Notify processor that a new job is available for immediate pickup
+        if processor and hasattr(processor.job_processor, '_job_available_event'):
+            processor.job_processor._job_available_event.set()
+
         model_type = "IndicConformer" if use_indic_model else "Parakeet"
         logger.info(
             f"Audio file submitted: {request_id} - {file.filename} "
